@@ -115,6 +115,14 @@ class Config:
     micro_weight_decay: float = 1e-5
     micro_aug_noise_std: float = 0.01
     micro_aug_vm_std: float = 0.01
+    # ===== MODIFIED SECTION (PATCH Z1): zone-aware top-2 GMPPT robustness =====
+    zone_count: int = 4
+    zone_conf_threshold_default: float = 0.58
+    zone_conf_threshold_search_min: float = 0.35
+    zone_conf_threshold_search_max: float = 0.85
+    zone_conf_threshold_search_steps: int = 21
+    zone_low_conf_widen_margin: float = 0.08
+    zone_loss_lambda: float = 0.40
 
     # evaluation
     evaluate_all_test_curves: bool = True
@@ -457,8 +465,21 @@ def extract_sparse_features(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarr
 
     i_norm = (iq / (isc + 1e-12)).astype(np.float32)
     p_norm = (pq / (voc * isc + 1e-12)).astype(np.float32)
+    # ===== MODIFIED SECTION (PATCH Z5): lightweight physics-informed sparse-shape indicators =====
+    mid_k = int(len(vq) // 2)
+    k_l = max(mid_k - 1, 0)
+    k_r = min(mid_k + 1, len(vq) - 1)
+    dv_mid = float(vq[k_r] - vq[k_l]) if k_r > k_l else 1e-9
+    di_mid = float(iq[k_r] - iq[k_l]) if k_r > k_l else 0.0
+    norm_mid_slope = np.float32(di_mid / max(dv_mid * isc, 1e-9))
+    drop_idx = min(mid_k, len(iq) - 2)
+    curr_drop_ratio = np.float32((iq[drop_idx] - iq[drop_idx + 1]) / max(isc, 1e-9))
+    p_curv = np.float32(
+        ((pq[k_l] - 2.0 * pq[mid_k] + pq[k_r]) / max(voc * isc, 1e-9))
+        if (k_l < mid_k < k_r) else 0.0
+    )
 
-    scalar = np.array([voc, isc, voc * isc], dtype=np.float32)
+    scalar = np.array([voc, isc, voc * isc, norm_mid_slope, curr_drop_ratio, p_curv], dtype=np.float32)
     seq = np.stack([i_norm, p_norm], axis=0).astype(np.float32)  # (2,12)
     flat = np.concatenate([scalar, i_norm, p_norm], axis=0).astype(np.float32)
 
@@ -483,6 +504,7 @@ def extract_sparse_features(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarr
         "y_vmpp_norm": np.float32(np.clip(vmpp / (voc + 1e-12), 0.0, 1.0)),
         "vmpp_true": np.float32(vmpp),
         "pmpp_true": np.float32(pmpp),
+        "y_zone": np.int64(np.clip(int(np.floor(np.clip((vmpp / (voc + 1e-12)), 0.0, 1.0 - 1e-9) * cfg.zone_count)), 0, cfg.zone_count - 1)),
         "coarse_best_v": np.float32(coarse_best_v),
         "coarse_best_p": np.float32(coarse_best_p),
         "coarse_multipeak": np.int64(coarse_multipeak),
@@ -578,7 +600,7 @@ class MultiTaskMLP(nn.Module):
 class TinyHybridCNN(nn.Module):
     """PATCH BLOCK B: tiny 1D-CNN with learned candidate heads."""
 
-    def __init__(self, scalar_dim: int = 3):
+    def __init__(self, scalar_dim: int = 6):
         super().__init__()
         self.seq_branch = nn.Sequential(
             nn.Conv1d(2, 16, kernel_size=3, padding=1),
@@ -612,6 +634,155 @@ class TinyHybridCNN(nn.Module):
         cand_rank_logits = self.candidate_logit_head(h)
         cand_valid_logits = self.candidate_valid_head(h)
         return mean, logvar, shade_logit, cand_v, cand_rank_logits, cand_valid_logits
+
+
+class ZoneClassifierMLP(nn.Module):
+    """PATCH Z6: lightweight deployment-minded zone classifier."""
+
+    def __init__(self, input_dim: int, zone_count: int = 4, dropout: float = 0.08):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.75),
+            nn.Linear(64, zone_count),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def zone_distance_weighted_loss(zone_logits: torch.Tensor, zone_true: torch.Tensor, zone_count: int, lambda_dist: float = 0.40) -> torch.Tensor:
+    """PATCH Z4: distance-aware cross-entropy that penalizes far-zone errors stronger."""
+    ce = F.cross_entropy(zone_logits, zone_true, reduction="mean")
+    probs = torch.softmax(zone_logits, dim=1)
+    idx = torch.arange(zone_count, device=zone_logits.device).float()[None, :]
+    true_idx = zone_true.float().unsqueeze(1)
+    dist = torch.abs(idx - true_idx)
+    dist_pen = (probs * dist).sum(dim=1).mean()
+    return ce + float(lambda_dist) * dist_pen
+
+
+def train_zone_classifier(model, x_train: np.ndarray, y_train: np.ndarray, x_val: np.ndarray, y_val: np.ndarray, cfg: Config, epochs: int = 40):
+    opt = optim.AdamW(model.parameters(), lr=cfg.lr_pretrain, weight_decay=cfg.weight_decay)
+    best = float("inf")
+    best_state = None
+    patience = cfg.early_stop_patience
+    for ep in range(1, epochs + 1):
+        model.train()
+        idx = np.random.permutation(len(x_train))
+        for st in range(0, len(idx), cfg.batch_size):
+            b = idx[st:st + cfg.batch_size]
+            if len(b) < 2:
+                continue
+            xb = torch.tensor(x_train[b], dtype=torch.float32, device=cfg.device)
+            yb = torch.tensor(y_train[b], dtype=torch.long, device=cfg.device)
+            logits = model(xb)
+            loss = zone_distance_weighted_loss(logits, yb, cfg.zone_count, lambda_dist=cfg.zone_loss_lambda)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        model.eval()
+        with torch.no_grad():
+            xv = torch.tensor(x_val, dtype=torch.float32, device=cfg.device)
+            yv = torch.tensor(y_val, dtype=torch.long, device=cfg.device)
+            lv = zone_distance_weighted_loss(model(xv), yv, cfg.zone_count, lambda_dist=cfg.zone_loss_lambda).item()
+        print(f"[zone] epoch {ep:03d} val_loss={lv:.5f}")
+        if lv < best - 1e-6:
+            best = lv
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience = cfg.early_stop_patience
+        else:
+            patience -= 1
+            if patience <= 0:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model
+
+
+def zone_predict_with_probs(zone_model, x: np.ndarray, cfg: Config) -> Tuple[np.ndarray, np.ndarray]:
+    zone_model.eval()
+    with torch.no_grad():
+        logits = zone_model(torch.tensor(x, dtype=torch.float32, device=cfg.device))
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+    return logits.cpu().numpy(), probs
+
+
+def zone_evaluation_report(zone_model, x: np.ndarray, y: np.ndarray, cfg: Config) -> Dict[str, float]:
+    if len(x) == 0:
+        return {"n": 0}
+    _logits, probs = zone_predict_with_probs(zone_model, x, cfg)
+    yhat = np.argmax(probs, axis=1)
+    cm = np.zeros((cfg.zone_count, cfg.zone_count), dtype=int)
+    for t, p in zip(y.astype(int), yhat.astype(int)):
+        cm[t, p] += 1
+    precision = {}
+    recall = {}
+    f1 = {}
+    for z in range(cfg.zone_count):
+        tp = cm[z, z]
+        fp = cm[:, z].sum() - tp
+        fn = cm[z, :].sum() - tp
+        pr = tp / max(tp + fp, 1)
+        rc = tp / max(tp + fn, 1)
+        fz = 2 * pr * rc / max(pr + rc, 1e-9)
+        precision[f"zone_{z}"] = float(pr)
+        recall[f"zone_{z}"] = float(rc)
+        f1[f"zone_{z}"] = float(fz)
+    adj_err = int(np.sum((yhat != y) & (np.abs(yhat - y) == 1)))
+    far_err = int(np.sum((yhat != y) & (np.abs(yhat - y) > 1)))
+    top2 = np.argsort(-probs, axis=1)[:, :2]
+    top2_contains = float(np.mean(np.any(top2 == y.reshape(-1, 1), axis=1)))
+    return {
+        "n": int(len(y)),
+        "top1_accuracy": float(np.mean(yhat == y)),
+        "top2_contains_true_zone_rate": float(top2_contains),
+        "adjacent_zone_error_count": adj_err,
+        "far_zone_error_count": far_err,
+        "confusion_matrix": cm.tolist(),
+        "per_zone_precision": precision,
+        "per_zone_recall": recall,
+        "per_zone_f1": f1,
+    }
+
+
+def calibrate_zone_confidence_threshold(zone_model, x_val: np.ndarray, y_val: np.ndarray, cfg: Config) -> Dict[str, float]:
+    if len(x_val) == 0:
+        return {"zone_conf_threshold": float(cfg.zone_conf_threshold_default), "zone_confidence_calibration_summary": {"status": "empty_val"}}
+    _logits, probs = zone_predict_with_probs(zone_model, x_val, cfg)
+    conf = np.max(probs, axis=1)
+    pred = np.argmax(probs, axis=1)
+    correct = (pred == y_val.astype(int))
+    best = {"th": cfg.zone_conf_threshold_default, "score": -1.0}
+    for th in np.linspace(cfg.zone_conf_threshold_search_min, cfg.zone_conf_threshold_search_max, cfg.zone_conf_threshold_search_steps):
+        high = conf >= th
+        if np.sum(high) == 0:
+            continue
+        high_acc = np.mean(correct[high])
+        low_far = np.mean((~correct[~high]) & (np.abs(pred[~high] - y_val[~high]) > 1)) if np.sum(~high) else 0.0
+        score = 0.75 * high_acc - 0.25 * low_far
+        if score > best["score"]:
+            best = {"th": float(th), "score": float(score), "high_acc": float(high_acc), "low_far": float(low_far), "high_frac": float(np.mean(high))}
+    return {
+        "zone_conf_threshold": float(best["th"]),
+        "zone_confidence_calibration_summary": {
+            "selected_threshold": float(best["th"]),
+            "selection_score": float(best["score"]),
+            "high_conf_accuracy": float(best.get("high_acc", 0.0)),
+            "low_conf_far_error_rate": float(best.get("low_far", 0.0)),
+            "high_conf_fraction": float(best.get("high_frac", 0.0)),
+        },
+    }
 
 
 class MicroShadeMLP(nn.Module):
@@ -714,8 +885,8 @@ def hetero_regression_loss(y, mu, logvar):
 
 
 def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: str):
-    x_flat_tr, x_scalar_tr, x_seq_tr, yv_tr, ys_tr, ycv_tr, ycvd_tr, ycr_tr = train_arrays
-    x_flat_va, x_scalar_va, x_seq_va, yv_va, ys_va, ycv_va, ycvd_va, ycr_va = val_arrays
+    x_flat_tr, x_scalar_tr, x_seq_tr, yv_tr, ys_tr, ycv_tr, ycvd_tr, ycr_tr, *_ = train_arrays
+    x_flat_va, x_scalar_va, x_seq_va, yv_va, ys_va, ycv_va, ycvd_va, ycr_va, *_ = val_arrays
 
     # ===== MODIFIED SECTION (PATCH 3): fail-fast shape checks before each training stage =====
     assert len(x_flat_tr) == len(x_scalar_tr) == len(x_seq_tr) == len(yv_tr) == len(ys_tr) == len(ycv_tr) == len(ycvd_tr) == len(ycr_tr), (
@@ -826,7 +997,7 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
 def augment_train_arrays(train_arrays, cfg: Config):
     """PATCH 7: lightweight physically-plausible augmentation on TRAIN arrays only."""
     # ===== MODIFIED SECTION (PATCH 1): accept/return full multitask tuple; augment features only =====
-    x_flat, x_scalar, x_seq, yv, ys, y_cand_v, y_cand_valid, y_cand_rank_target = train_arrays
+    x_flat, x_scalar, x_seq, yv, ys, y_cand_v, y_cand_valid, y_cand_rank_target, *_ = train_arrays
     xf = x_flat.copy()
     xs = x_scalar.copy()
     xq = x_seq.copy()
@@ -931,7 +1102,7 @@ def model_predict_api(
 
 
 def calibrate_uncertainty(model, arrays_cal, cfg: Config) -> Dict[str, float]:
-    x_flat, x_scalar, x_seq, yv, _ys, _ycv, _ycvd, _ycr = arrays_cal
+    x_flat, x_scalar, x_seq, yv, _ys, _ycv, _ycvd, _ycr, *_ = arrays_cal
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, device=cfg.device)
@@ -978,7 +1149,7 @@ def calibrate_uncertainty(model, arrays_cal, cfg: Config) -> Dict[str, float]:
 
 def calibrate_shade_threshold(model, arrays_cal, cfg: Config) -> Dict[str, float]:
     """PATCH 3: calibration-driven shade threshold selection (safety-oriented)."""
-    x_flat, x_scalar, x_seq, _yv, ys, _ycv, _ycvd, _ycr = arrays_cal
+    x_flat, x_scalar, x_seq, _yv, ys, _ycv, _ycvd, _ycr, *_ = arrays_cal
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, device=cfg.device)
@@ -1322,7 +1493,7 @@ def local_positive_rate_summaries(states: List[Dict], split_name: str) -> Dict[s
 
 
 def uncertainty_diagnostics(model, arrays, calib, cfg: Config) -> Dict[str, float]:
-    x_flat, x_scalar, x_seq, yv, _, _ycv, _ycvd, _ycr = arrays
+    x_flat, x_scalar, x_seq, yv, _, _ycv, _ycvd, _ycr, *_ = arrays
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, device=cfg.device)
@@ -1343,7 +1514,7 @@ def uncertainty_diagnostics(model, arrays, calib, cfg: Config) -> Dict[str, floa
 
 def candidate_head_diagnostics(model, arrays, cfg: Config) -> Dict[str, float]:
     """PATCH BLOCK G: candidate-specific supervised head metrics."""
-    x_flat, x_scalar, x_seq, _yv, _ys, ycv, ycvd, ycr = arrays
+    x_flat, x_scalar, x_seq, _yv, _ys, ycv, ycvd, ycr, *_ = arrays
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, device=cfg.device)
@@ -1430,7 +1601,20 @@ def build_sparse_features_from_oracle(oracle: "CurveOracle", cfg: Config):
     isc = max(oracle.measure(0.0), 1e-12)
     i_norm = (iq / (isc + 1e-12)).astype(np.float32)
     p_norm = (pq / (voc * isc + 1e-12)).astype(np.float32)
-    scalar = np.array([voc, isc, voc * isc], dtype=np.float32)
+    # ===== MODIFIED SECTION (PATCH Z5): runtime mirror of physics-informed sparse-shape indicators =====
+    mid_k = int(len(vq) // 2)
+    k_l = max(mid_k - 1, 0)
+    k_r = min(mid_k + 1, len(vq) - 1)
+    dv_mid = float(vq[k_r] - vq[k_l]) if k_r > k_l else 1e-9
+    di_mid = float(iq[k_r] - iq[k_l]) if k_r > k_l else 0.0
+    norm_mid_slope = np.float32(di_mid / max(dv_mid * isc, 1e-9))
+    drop_idx = min(mid_k, len(iq) - 2)
+    curr_drop_ratio = np.float32((iq[drop_idx] - iq[drop_idx + 1]) / max(isc, 1e-9))
+    p_curv = np.float32(
+        ((pq[k_l] - 2.0 * pq[mid_k] + pq[k_r]) / max(voc * isc, 1e-9))
+        if (k_l < mid_k < k_r) else 0.0
+    )
+    scalar = np.array([voc, isc, voc * isc, norm_mid_slope, curr_drop_ratio, p_curv], dtype=np.float32)
     seq = np.stack([i_norm, p_norm], axis=0).astype(np.float32)
     flat = np.concatenate([scalar, i_norm, p_norm], axis=0).astype(np.float32)
     return vq, iq, pq, flat, scalar, seq
@@ -1748,12 +1932,28 @@ def run_deterministic_baseline(oracle: "CurveOracle", cfg: Config) -> Dict[str, 
     }
 
 
+def zone_to_voltage_window(zone_idx: int, voc: float, cfg: Config) -> Tuple[float, float]:
+    zone_w = (cfg.sample_fracs_max - cfg.sample_fracs_min) / max(cfg.zone_count, 1)
+    lo = cfg.sample_fracs_min + zone_w * int(zone_idx)
+    hi = cfg.sample_fracs_min + zone_w * (int(zone_idx) + 1)
+    return float(np.clip(lo * voc, cfg.sample_fracs_min * voc, cfg.sample_fracs_max * voc)), float(np.clip(hi * voc, cfg.sample_fracs_min * voc, cfg.sample_fracs_max * voc))
+
+
+def evaluate_zone_candidate(oracle: "CurveOracle", zone_idx: int, cfg: Config) -> Dict[str, float]:
+    zlo, zhi = zone_to_voltage_window(zone_idx, oracle.voc, cfg)
+    v_seed = float(0.5 * (zlo + zhi))
+    v_ref, p_ref, _ = refine_local(oracle, v_seed, cfg)
+    return {"zone": int(zone_idx), "seed_v": v_seed, "verified_v": float(v_ref), "verified_power": float(p_ref), "window_lo": float(zlo), "window_hi": float(zhi)}
+
+
 def run_hybrid_ml_controller(
     oracle: "CurveOracle",
     model,
     stdz,
     calib,
-    cfg: Config,
+    zone_bundle=None,
+    zone_mode: str = "top2",
+    cfg: Config = cfg,
     episode_idx: int = 0,
     runtime_state: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
@@ -1847,6 +2047,56 @@ def run_hybrid_ml_controller(
         pred["local_route_placeholder_candidates"] = False
         pred["candidate_fields_are_learned"] = True
         pred["controller_mode"] = "SHADE_GMPPT"
+        # ===== MODIFIED SECTION (PATCH Z1/Z2/Z3): zone logits/probs + top-2 verification =====
+        top1_zone = top2_zone = 0
+        top1_prob = top2_prob = 0.0
+        zone_verified_top1 = zone_verified_top2 = 0.0
+        selected_zone = -1
+        selected_zone_verified_power = 0.0
+        selected_zone_reason = "zone_disabled"
+        top2_used = False
+        fallback_after_top2 = False
+        low_zone_confidence = False
+        confidence_triggered_fallback = False
+        zone_confidence = 0.0
+        if isinstance(zone_bundle, dict) and zone_bundle.get("model", None) is not None:
+            z_model = zone_bundle["model"]
+            z_logits, z_probs = zone_predict_with_probs(z_model, flat_n, cfg)
+            z_logits = z_logits[0]
+            z_probs = z_probs[0]
+            z_order = np.argsort(-z_probs)
+            top1_zone = int(z_order[0])
+            top2_zone = int(z_order[1]) if len(z_order) > 1 else int(z_order[0])
+            top1_prob = float(z_probs[top1_zone])
+            top2_prob = float(z_probs[top2_zone])
+            zone_confidence = float(np.max(z_probs))
+            zone_conf_th = float(zone_bundle.get("zone_conf_threshold", cfg.zone_conf_threshold_default))
+            low_zone_confidence = bool(zone_confidence < zone_conf_th)
+            top1_eval = evaluate_zone_candidate(oracle, top1_zone, cfg)
+            zone_verified_top1 = float(top1_eval["verified_power"])
+            selected_eval = top1_eval
+            selected_zone_reason = "top1_default"
+            if str(zone_mode).lower() == "top2":
+                top2_eval = evaluate_zone_candidate(oracle, top2_zone, cfg)
+                zone_verified_top2 = float(top2_eval["verified_power"])
+                top2_used = True
+                selected_eval = top2_eval if zone_verified_top2 > zone_verified_top1 else top1_eval
+                selected_zone_reason = "top2_verified_better" if selected_eval["zone"] == top2_zone else "top1_verified_better"
+            selected_zone = int(selected_eval["zone"])
+            selected_zone_verified_power = float(selected_eval["verified_power"])
+            if low_zone_confidence:
+                wz = np.linspace(max(cfg.sample_fracs_min, min(top1_prob, top2_prob) - cfg.zone_low_conf_widen_margin), cfg.sample_fracs_max, cfg.widen_scan_steps) * oracle.voc
+                wp = np.array([vv * oracle.measure(vv) for vv in wz], dtype=float)
+                if len(wp) and float(np.max(wp)) > selected_zone_verified_power:
+                    selected_zone_reason = "low_confidence_widened_region"
+                    selected_zone_verified_power = float(np.max(wp))
+                    selected_zone = -1
+                    fallback_after_top2 = True
+                confidence_triggered_fallback = True
+            if selected_zone_verified_power >= pbest:
+                vbest = float(selected_eval.get("verified_v", vbest))
+                pbest = float(selected_zone_verified_power)
+
         low_confidence = int(pred["sigma"] >= calib["sigma_threshold"])
         cand_scores = np.array(pred["candidate_scores"], dtype=float)
         mean_cand_score = float(np.mean(cand_scores)) if len(cand_scores) else 0.0
@@ -1957,6 +2207,20 @@ def run_hybrid_ml_controller(
         "candidate_fields_are_learned": int(bool(pred.get("candidate_fields_are_learned", mode == "SHADE_GMPPT"))),
         "emergency_candidate_backup_used": int(bool(pred.get("emergency_candidate_backup_used", False))),
         "norm_vhat_coarse_gap": float(abs((pred["vhat"] * oracle.voc) - coarse_best_v) / max(oracle.voc, 1e-9)) if enter_shade_mode else 0.0,
+        "top1_zone": int(top1_zone) if enter_shade_mode else -1,
+        "top2_zone": int(top2_zone) if enter_shade_mode else -1,
+        "top1_prob": float(top1_prob) if enter_shade_mode else np.nan,
+        "top2_prob": float(top2_prob) if enter_shade_mode else np.nan,
+        "zone_confidence": float(zone_confidence) if enter_shade_mode else np.nan,
+        "low_zone_confidence": int(low_zone_confidence) if enter_shade_mode else 0,
+        "confidence_triggered_fallback": int(confidence_triggered_fallback) if enter_shade_mode else 0,
+        "top1_zone_verified_power": float(zone_verified_top1) if enter_shade_mode else np.nan,
+        "top2_zone_verified_power": float(zone_verified_top2) if enter_shade_mode else np.nan,
+        "selected_zone_verified_power": float(selected_zone_verified_power) if enter_shade_mode else np.nan,
+        "selected_zone_after_verification": int(selected_zone) if enter_shade_mode else -1,
+        "selected_zone_reason": str(selected_zone_reason) if enter_shade_mode else "not_in_shade_mode",
+        "top2_zone_evaluation_used": int(top2_used) if enter_shade_mode else 0,
+        "fallback_after_top2": int(fallback_after_top2) if enter_shade_mode else 0,
     }
 
 
@@ -2026,7 +2290,8 @@ def rows_to_arrays(rows: List[Dict]):
     y_cand_v = np.stack([r["y_cand_v"] for r in rows], axis=0).astype(np.float32)
     y_cand_valid = np.stack([r["y_cand_valid"] for r in rows], axis=0).astype(np.float32)
     y_cand_rank_target = np.stack([r["y_cand_rank_target"] for r in rows], axis=0).astype(np.float32)
-    return flat, scalar, seq, yv, ys, y_cand_v, y_cand_valid, y_cand_rank_target
+    y_zone = np.array([r["y_zone"] for r in rows], dtype=np.int64)
+    return flat, scalar, seq, yv, ys, y_cand_v, y_cand_valid, y_cand_rank_target, y_zone
 
 
 def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
@@ -2039,6 +2304,7 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
     return {
         "average_tracking_efficiency": float(df["efficiency"].mean()),
         "average_power_ratio": float(df["ratio"].mean()),
+        "five_percent_success_rate": float((df["v_diff_pct"] <= 5.0).mean()) if "v_diff_pct" in df else np.nan,
         "mean_voltage_percent_difference": float(df["v_diff_pct"].mean()),
         "p95_voltage_percent_difference": float(np.quantile(df["v_diff_pct"], 0.95)),
         "p99_voltage_percent_difference": float(np.quantile(df["v_diff_pct"], 0.99)),
@@ -2059,10 +2325,12 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
         "candidate_utility_scope": "rows_where_candidate_fields_are_learned==True",
         "candidate_utility_rows": int(len(learned_df)),
         "candidate_utility_rows_total": int(len(df)),
+        "top2_zone_evaluation_used_rate": float(df["top2_zone_evaluation_used"].mean()) if "top2_zone_evaluation_used" in df else np.nan,
+        "confidence_triggered_fallback_rate": float(df["confidence_triggered_fallback"].mean()) if "confidence_triggered_fallback" in df else np.nan,
     }
 
 
-def evaluate_controller(rows: List[Dict], mode: str, model=None, stdz=None, calib=None, cfg: Config = cfg):
+def evaluate_controller(rows: List[Dict], mode: str, model=None, stdz=None, calib=None, zone_bundle=None, zone_mode: str = "top2", cfg: Config = cfg):
     records = []
     eval_rows = rows if cfg.evaluate_all_test_curves else rows[: cfg.max_eval_curves]
     runtime_state = {}
@@ -2071,7 +2339,17 @@ def evaluate_controller(rows: List[Dict], mode: str, model=None, stdz=None, cali
         if mode == "deterministic":
             out = run_deterministic_baseline(oracle, cfg)
         else:
-            out = run_hybrid_ml_controller(oracle, model, stdz, calib, cfg, episode_idx=ep, runtime_state=runtime_state)
+            out = run_hybrid_ml_controller(
+                oracle,
+                model,
+                stdz,
+                calib,
+                zone_bundle=zone_bundle,
+                zone_mode=zone_mode,
+                cfg=cfg,
+                episode_idx=ep,
+                runtime_state=runtime_state,
+            )
 
         out["v_diff_pct"] = 100.0 * abs(out["final_V_best"] - oracle.vmpp_true) / (abs(oracle.vmpp_true) + 1e-9)
         out["dense_peak_count"] = int(r["dense_peak_count"])
@@ -2093,7 +2371,7 @@ def bootstrap_ci_mean(x: np.ndarray, n_boot: int = 500, seed: int = 7) -> Tuple[
     return float(np.quantile(m, 0.025)), float(np.quantile(m, 0.975))
 
 
-def evaluate_dynamic_scenarios(rows: List[Dict], model, stdz, calib, cfg: Config):
+def evaluate_dynamic_scenarios(rows: List[Dict], model, stdz, calib, zone_bundle=None, cfg: Config = cfg):
     shaded_rows = [r for r in rows if int(r["y_shade"]) == 1]
     nonsh_rows = [r for r in rows if int(r["y_shade"]) == 0]
     if len(rows) == 0:
@@ -2111,7 +2389,7 @@ def evaluate_dynamic_scenarios(rows: List[Dict], model, stdz, calib, cfg: Config
     for name, seq_rows in scenarios.items():
         if len(seq_rows) < 3:
             continue
-        df_h, met_h = evaluate_controller(seq_rows, mode="ml", model=model, stdz=stdz, calib=calib, cfg=cfg)
+        df_h, met_h = evaluate_controller(seq_rows, mode="ml", model=model, stdz=stdz, calib=calib, zone_bundle=zone_bundle, zone_mode="top2", cfg=cfg)
         df_d, met_d = evaluate_controller(seq_rows, mode="deterministic", cfg=cfg)
         dyn_report[name] = {
             "average_power_ratio": float(met_h["average_power_ratio"]),
@@ -2262,13 +2540,13 @@ test_set_mode = split_info["test_set_mode"]
 heldout_shaded_count = split_info["heldout_shaded_count"]
 
 # standardizer fit on pretraining set
-sim_flat, sim_scalar, sim_seq, sim_yv, sim_ys, sim_ycv, sim_ycvd, sim_ycr = rows_to_arrays(sim_rows)
+sim_flat, sim_scalar, sim_seq, sim_yv, sim_ys, sim_ycv, sim_ycvd, sim_ycr, sim_yzone = rows_to_arrays(sim_rows)
 stdz = fit_feature_standardizer(sim_flat, sim_scalar)
 
 sim_flat_n, sim_scalar_n, sim_seq_n = apply_standardizer(sim_flat, sim_scalar, sim_seq, stdz)
-exp_ft_flat, exp_ft_scalar, exp_ft_seq, exp_ft_yv, exp_ft_ys, exp_ft_ycv, exp_ft_ycvd, exp_ft_ycr = rows_to_arrays(exp_ft_rows)
-exp_cal_flat, exp_cal_scalar, exp_cal_seq, exp_cal_yv, exp_cal_ys, exp_cal_ycv, exp_cal_ycvd, exp_cal_ycr = rows_to_arrays(exp_cal_rows)
-exp_test_flat, exp_test_scalar, exp_test_seq, exp_test_yv, exp_test_ys, exp_test_ycv, exp_test_ycvd, exp_test_ycr = rows_to_arrays(exp_test_rows)
+exp_ft_flat, exp_ft_scalar, exp_ft_seq, exp_ft_yv, exp_ft_ys, exp_ft_ycv, exp_ft_ycvd, exp_ft_ycr, exp_ft_yzone = rows_to_arrays(exp_ft_rows)
+exp_cal_flat, exp_cal_scalar, exp_cal_seq, exp_cal_yv, exp_cal_ys, exp_cal_ycv, exp_cal_ycvd, exp_cal_ycr, exp_cal_yzone = rows_to_arrays(exp_cal_rows)
+exp_test_flat, exp_test_scalar, exp_test_seq, exp_test_yv, exp_test_ys, exp_test_ycv, exp_test_ycvd, exp_test_ycr, exp_test_yzone = rows_to_arrays(exp_test_rows)
 
 exp_ft_flat_n, exp_ft_scalar_n, exp_ft_seq_n = apply_standardizer(exp_ft_flat, exp_ft_scalar, exp_ft_seq, stdz)
 exp_cal_flat_n, exp_cal_scalar_n, exp_cal_seq_n = apply_standardizer(exp_cal_flat, exp_cal_scalar, exp_cal_seq, stdz)
@@ -2276,17 +2554,17 @@ exp_test_flat_n, exp_test_scalar_n, exp_test_seq_n = apply_standardizer(exp_test
 
 # pretrain/finetune shared for MLP + CNN
 mlp = MultiTaskMLP(in_dim=sim_flat_n.shape[1], dropout=cfg.dropout).to(cfg.device)
-cnn = TinyHybridCNN(scalar_dim=3).to(cfg.device)
+cnn = TinyHybridCNN(scalar_dim=6).to(cfg.device)
 
 # small validation slice from simulation
 idx = np.arange(len(sim_flat_n))
 tr, va = train_test_split(idx, test_size=0.15, random_state=cfg.seed)
 
-sim_train = (sim_flat_n[tr], sim_scalar_n[tr], sim_seq_n[tr], sim_yv[tr], sim_ys[tr], sim_ycv[tr], sim_ycvd[tr], sim_ycr[tr])
-sim_val = (sim_flat_n[va], sim_scalar_n[va], sim_seq_n[va], sim_yv[va], sim_ys[va], sim_ycv[va], sim_ycvd[va], sim_ycr[va])
-exp_ft_arrays = (exp_ft_flat_n, exp_ft_scalar_n, exp_ft_seq_n, exp_ft_yv, exp_ft_ys, exp_ft_ycv, exp_ft_ycvd, exp_ft_ycr)
-exp_cal_arrays = (exp_cal_flat_n, exp_cal_scalar_n, exp_cal_seq_n, exp_cal_yv, exp_cal_ys, exp_cal_ycv, exp_cal_ycvd, exp_cal_ycr)
-exp_test_arrays = (exp_test_flat_n, exp_test_scalar_n, exp_test_seq_n, exp_test_yv, exp_test_ys, exp_test_ycv, exp_test_ycvd, exp_test_ycr)
+sim_train = (sim_flat_n[tr], sim_scalar_n[tr], sim_seq_n[tr], sim_yv[tr], sim_ys[tr], sim_ycv[tr], sim_ycvd[tr], sim_ycr[tr], sim_yzone[tr])
+sim_val = (sim_flat_n[va], sim_scalar_n[va], sim_seq_n[va], sim_yv[va], sim_ys[va], sim_ycv[va], sim_ycvd[va], sim_ycr[va], sim_yzone[va])
+exp_ft_arrays = (exp_ft_flat_n, exp_ft_scalar_n, exp_ft_seq_n, exp_ft_yv, exp_ft_ys, exp_ft_ycv, exp_ft_ycvd, exp_ft_ycr, exp_ft_yzone)
+exp_cal_arrays = (exp_cal_flat_n, exp_cal_scalar_n, exp_cal_seq_n, exp_cal_yv, exp_cal_ys, exp_cal_ycv, exp_cal_ycvd, exp_cal_ycr, exp_cal_yzone)
+exp_test_arrays = (exp_test_flat_n, exp_test_scalar_n, exp_test_seq_n, exp_test_yv, exp_test_ys, exp_test_ycv, exp_test_ycvd, exp_test_ycr, exp_test_yzone)
 
 print("\n=== 1) dataset summary ===")
 print({
@@ -2318,6 +2596,33 @@ print("\n=== 3) model summary for MLP ===")
 print(mlp)
 print("\n=== 4) model summary for CNN ===")
 print(cnn)
+
+# ===== MODIFIED SECTION (PATCH Z4/Z6/Z7): standalone zone classifier (distance-aware) =====
+zone_classifier = ZoneClassifierMLP(input_dim=sim_flat_n.shape[1], zone_count=cfg.zone_count, dropout=cfg.dropout).to(cfg.device)
+zone_classifier = train_zone_classifier(
+    zone_classifier,
+    x_train=sim_flat_n[tr],
+    y_train=sim_yzone[tr],
+    x_val=sim_flat_n[va],
+    y_val=sim_yzone[va],
+    cfg=cfg,
+    epochs=max(20, cfg.pretrain_epochs),
+)
+zone_classifier = train_zone_classifier(
+    zone_classifier,
+    x_train=exp_ft_flat_n,
+    y_train=exp_ft_yzone,
+    x_val=exp_cal_flat_n,
+    y_val=exp_cal_yzone,
+    cfg=cfg,
+    epochs=max(12, cfg.finetune_epochs),
+)
+zone_param_count = int(sum(p.numel() for p in zone_classifier.parameters()))
+zone_arch_summary = f"{sim_flat_n.shape[1]}->128->128->64->{cfg.zone_count} (ReLU+BatchNorm+Dropout)"
+zone_cal = calibrate_zone_confidence_threshold(zone_classifier, exp_cal_flat_n, exp_cal_yzone, cfg)
+zone_report_train = zone_evaluation_report(zone_classifier, exp_ft_flat_n, exp_ft_yzone, cfg)
+zone_report_val = zone_evaluation_report(zone_classifier, exp_cal_flat_n, exp_cal_yzone, cfg)
+zone_report_test = zone_evaluation_report(zone_classifier, exp_test_flat_n, exp_test_yzone, cfg)
 
 mlp_cal = calibrate_uncertainty(mlp, exp_cal_arrays, cfg)
 cnn_cal = calibrate_uncertainty(cnn, exp_cal_arrays, cfg)
@@ -2501,6 +2806,8 @@ mlp_cal.update({
     "local_runtime_detector_metrics": local_runtime_detector_metrics,
     "micro_detector": micro_detector,
     "micro_feature_runtime_safe": True,
+    "zone_conf_threshold": float(zone_cal.get("zone_conf_threshold", cfg.zone_conf_threshold_default)),
+    "zone_confidence_calibration_summary": zone_cal.get("zone_confidence_calibration_summary", {}),
 })
 cnn_cal.update({
     "micro_ml_detector_trained": bool(micro_detector_trained),
@@ -2512,6 +2819,8 @@ cnn_cal.update({
     "local_runtime_detector_metrics": local_runtime_detector_metrics,
     "micro_detector": micro_detector,
     "micro_feature_runtime_safe": True,
+    "zone_conf_threshold": float(zone_cal.get("zone_conf_threshold", cfg.zone_conf_threshold_default)),
+    "zone_confidence_calibration_summary": zone_cal.get("zone_confidence_calibration_summary", {}),
 })
 # PATCH 3: candidate score threshold calibration (safety-oriented accept gate).
 mlp_candidate_cal = calibrate_candidate_score_threshold(mlp, exp_cal_rows, stdz, mlp_cal, cfg)
@@ -2521,6 +2830,35 @@ cnn_cal.update(cnn_candidate_cal)
 
 print("\n=== 5) uncertainty calibration summary ===")
 print({"mlp": mlp_cal, "cnn": cnn_cal})
+print("\n=== 5Z) zone analysis report ===")
+zone_analysis_report = {
+    "zone_loss_mode": "distance_weighted_cross_entropy",
+    "zone_classifier_architecture": zone_arch_summary,
+    "parameter_count_zone_classifier": int(zone_param_count),
+    "zone_conf_threshold": float(zone_cal.get("zone_conf_threshold", cfg.zone_conf_threshold_default)),
+    "zone_confidence_calibration_summary": zone_cal.get("zone_confidence_calibration_summary", {}),
+    "train_accuracy": float(zone_report_train.get("top1_accuracy", np.nan)),
+    "validation_accuracy": float(zone_report_val.get("top1_accuracy", np.nan)),
+    "test_accuracy": float(zone_report_test.get("top1_accuracy", np.nan)),
+    "top1_accuracy": float(zone_report_test.get("top1_accuracy", np.nan)),
+    "top2_contains_true_zone_rate": float(zone_report_test.get("top2_contains_true_zone_rate", np.nan)),
+    "adjacent_zone_error_count": int(zone_report_test.get("adjacent_zone_error_count", 0)),
+    "far_zone_error_count": int(zone_report_test.get("far_zone_error_count", 0)),
+    "confusion_matrix": zone_report_test.get("confusion_matrix", []),
+    "per_zone_precision": zone_report_test.get("per_zone_precision", {}),
+    "per_zone_recall": zone_report_test.get("per_zone_recall", {}),
+    "per_zone_f1": zone_report_test.get("per_zone_f1", {}),
+    "feature_separability_summary": {
+        "feature_dim_final": int(sim_flat_n.shape[1]),
+        "physics_features_added": ["norm_mid_slope", "current_drop_ratio", "p_curve_curvature"],
+    },
+}
+print(zone_analysis_report)
+
+zone_bundle = {
+    "model": zone_classifier,
+    "zone_conf_threshold": float(zone_cal.get("zone_conf_threshold", cfg.zone_conf_threshold_default)),
+}
 
 # flat metrics
 mlp_flat = uncertainty_diagnostics(mlp, exp_test_arrays, mlp_cal, cfg)
@@ -2530,8 +2868,9 @@ cnn_candidate_metrics = candidate_head_diagnostics(cnn, exp_test_arrays, cfg)
 
 # controller evaluations
 df_det, met_det = evaluate_controller(exp_test_rows, mode="deterministic", cfg=cfg)
-df_mlp, met_mlp = evaluate_controller(exp_test_rows, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
-df_cnn, met_cnn = evaluate_controller(exp_test_rows, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
+df_mlp, met_mlp = evaluate_controller(exp_test_rows, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, zone_bundle=zone_bundle, zone_mode="top2", cfg=cfg)
+df_cnn, met_cnn = evaluate_controller(exp_test_rows, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, zone_bundle=zone_bundle, zone_mode="top2", cfg=cfg)
+df_mlp_hard, met_mlp_hard = evaluate_controller(exp_test_rows, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, zone_bundle=zone_bundle, zone_mode="hard", cfg=cfg)
 print({
     "evaluate_all_test_curves": cfg.evaluate_all_test_curves,
     "n_test_curves_evaluated": len(df_det),
@@ -2543,22 +2882,42 @@ print("\n=== 7) hybrid MLP controller results ===")
 print(met_mlp)
 print("\n=== 8) hybrid CNN controller results ===")
 print(met_cnn)
+print("\n=== 8Z) hard-zone vs top2-zone controller comparison (MLP route) ===")
+hard_vs_top2_table = pd.DataFrame([
+    {"method": "hard_single_zone_controller", **met_mlp_hard},
+    {"method": "top2_zone_controller", **met_mlp},
+    {"method": "deterministic_baseline", **met_det},
+])[[
+    "method",
+    "mean_voltage_percent_difference",
+    "p95_voltage_percent_difference",
+    "p99_voltage_percent_difference",
+    "average_power_ratio",
+    "fallback_rate",
+]]
+hard_vs_top2_table["<=5pct_success_rate"] = [
+    float((df_mlp_hard["v_diff_pct"] <= 5.0).mean()),
+    float((df_mlp["v_diff_pct"] <= 5.0).mean()),
+    float((df_det["v_diff_pct"] <= 5.0).mean()),
+]
+print(hard_vs_top2_table)
 
 # shaded-only held-out
 shaded_test = [r for r in exp_test_rows if int(r["y_shade"]) == 1]
 if len(shaded_test) > 0:
     _, sh_det = evaluate_controller(shaded_test, mode="deterministic", cfg=cfg)
-    _, sh_mlp = evaluate_controller(shaded_test, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
-    _, sh_cnn = evaluate_controller(shaded_test, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
+    _, sh_mlp = evaluate_controller(shaded_test, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, zone_bundle=zone_bundle, zone_mode="top2", cfg=cfg)
+    _, sh_cnn = evaluate_controller(shaded_test, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, zone_bundle=zone_bundle, zone_mode="top2", cfg=cfg)
+    _, sh_mlp_hard = evaluate_controller(shaded_test, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, zone_bundle=zone_bundle, zone_mode="hard", cfg=cfg)
 else:
-    sh_det = sh_mlp = sh_cnn = {"note": "no explicit shaded held-out curves"}
+    sh_det = sh_mlp = sh_cnn = sh_mlp_hard = {"note": "no explicit shaded held-out curves"}
 
 print("\n=== 9) shaded-only held-out comparison ===")
 print({"deterministic": sh_det, "mlp": sh_mlp, "cnn": sh_cnn})
 
 # PATCH 4: explicit coarse-scan shade detector report + separate local escalation detector report.
 def evaluate_coarse_shade_head(model, arrays, cfg: Config):
-    x_flat, x_scalar, x_seq, _yv, ys, _ycv, _ycvd, _ycr = arrays
+    x_flat, x_scalar, x_seq, _yv, ys, _ycv, _ycvd, _ycr, *_ = arrays
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, dtype=torch.float32, device=cfg.device)
@@ -2975,6 +3334,22 @@ final_recommendation = {
     "pilot_ready": bool(pilot_ready),
     "industry_ready": bool(industry_ready),
     "deployable": deployable,
+    # ===== MODIFIED SECTION (PATCH Z10): explicit top-2 zone recommendation fields =====
+    "top2_zone_enabled": True,
+    "top2_contains_true_zone_rate": float(zone_report_test.get("top2_contains_true_zone_rate", np.nan)),
+    "five_percent_success_rate_hard_zone": float((df_mlp_hard["v_diff_pct"] <= 5.0).mean()) if len(df_mlp_hard) else np.nan,
+    "five_percent_success_rate_top2_zone": float((df_mlp["v_diff_pct"] <= 5.0).mean()) if len(df_mlp) else np.nan,
+    "hard_zone_vs_top2_gain": float(met_mlp.get("average_power_ratio", np.nan) - met_mlp_hard.get("average_power_ratio", np.nan)),
+    "catastrophic_miss_reduction": float(((df_mlp_hard["v_diff_pct"] > 20.0).mean() - (df_mlp["v_diff_pct"] > 20.0).mean())) if (len(df_mlp_hard) and len(df_mlp)) else np.nan,
+    "top2_zone_evaluation_reduced_catastrophic_misses": bool(
+        ((df_mlp_hard["v_diff_pct"] > 20.0).mean() - (df_mlp["v_diff_pct"] > 20.0).mean()) > 0.0
+    ) if (len(df_mlp_hard) and len(df_mlp)) else False,
+    "fallback_rate_hard_zone": float(met_mlp_hard.get("fallback_rate", np.nan)),
+    "fallback_rate_top2_zone": float(met_mlp.get("fallback_rate", np.nan)),
+    "top2_upgrade_worth_keeping": bool(
+        (met_mlp.get("five_percent_success_rate", 0.0) >= met_mlp_hard.get("five_percent_success_rate", 0.0))
+        and (met_mlp.get("average_power_ratio", 0.0) >= met_mlp_hard.get("average_power_ratio", 0.0))
+    ),
     "note": "ML predicts Vmpp prior + uncertainty + candidate voltages + candidate confidences; deterministic controller verifies learned candidates before accepting them; fallback remains the certifiable safety path; dynamic/static standards gates are proxy_only until IEC/EN+HIL validation.",
 }
 if final_recommendation["local_escalation_detector_mode"] == "deterministic_heuristic":
@@ -3109,8 +3484,8 @@ print({
 })
 
 # PATCH 6: dynamic reporting (proxy separated from standards-grade validation)
-dynamic_transition_proxy_report_mlp = evaluate_dynamic_scenarios(exp_test_rows, model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
-dynamic_transition_proxy_report_cnn = evaluate_dynamic_scenarios(exp_test_rows, model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
+dynamic_transition_proxy_report_mlp = evaluate_dynamic_scenarios(exp_test_rows, model=mlp, stdz=stdz, calib=mlp_cal, zone_bundle=zone_bundle, cfg=cfg)
+dynamic_transition_proxy_report_cnn = evaluate_dynamic_scenarios(exp_test_rows, model=cnn, stdz=stdz, calib=cnn_cal, zone_bundle=zone_bundle, cfg=cfg)
 standards_dynamic_energy_report = {
     "validated": False,
     "status": "not_validated",
