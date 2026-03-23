@@ -187,9 +187,18 @@ def extract_vi(curve) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     c = np.asarray(curve)
     if c.ndim != 2:
         return None, None
-    if c.shape[0] == 2:
+    # Preferred/common layouts:
+    # - [2, N] or [3, N] (rows are V, I, optional P)
+    # - [N, 2] or [N, 3] (cols are V, I, optional P)
+    if c.shape[0] in (2, 3):
         return np.asarray(c[0], dtype=float).ravel(), np.asarray(c[1], dtype=float).ravel()
-    if c.shape[1] == 2:
+    if c.shape[1] in (2, 3):
+        return np.asarray(c[:, 0], dtype=float).ravel(), np.asarray(c[:, 1], dtype=float).ravel()
+
+    # Fallback for uncommon but still parseable shapes.
+    if c.shape[1] > c.shape[0] and c.shape[0] >= 2:
+        return np.asarray(c[0], dtype=float).ravel(), np.asarray(c[1], dtype=float).ravel()
+    if c.shape[0] > c.shape[1] and c.shape[1] >= 2:
         return np.asarray(c[:, 0], dtype=float).ravel(), np.asarray(c[:, 1], dtype=float).ravel()
     return None, None
 
