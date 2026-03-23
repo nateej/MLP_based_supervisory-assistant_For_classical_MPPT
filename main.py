@@ -5,6 +5,7 @@
 
 import os
 import random
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -78,6 +79,12 @@ class Config:
     anomaly_drop_ratio: float = 0.94
     low_conf_widen_threshold: float = 0.35
     nonshaded_no_harm_tolerance: float = 0.002
+    candidate_conf_threshold: float = 0.55
+    relaxed_compute_latency_threshold_sec: float = 0.005
+    preferred_compute_latency_threshold_sec: float = 0.001
+    static_efficiency_threshold: float = 0.99
+    dynamic_efficiency_threshold: float = 0.99
+    research_only_mode: bool = False
 
     # evaluation
     evaluate_all_test_curves: bool = True
@@ -416,7 +423,7 @@ def apply_standardizer(flat: np.ndarray, scalar: np.ndarray, seq: np.ndarray, st
 # NEW CLASSES ADDED
 # -------------------------
 class MultiTaskMLP(nn.Module):
-    """NEW CLASS ADDED: tiny MLP with mean/logvar/shade heads."""
+    """PATCH 1 (Option B): tiny MLP with deterministic candidate generation downstream."""
 
     def __init__(self, in_dim: int, dropout: float = 0.08):
         super().__init__()
@@ -430,21 +437,17 @@ class MultiTaskMLP(nn.Module):
         self.head_mean = nn.Linear(32, 1)
         self.head_logvar = nn.Linear(32, 1)
         self.head_shade = nn.Linear(32, 1)
-        self.head_width = nn.Linear(32, 1)
-        self.head_candidate_logits = nn.Linear(32, 3)
 
     def forward(self, x_flat, _x_scalar=None, _x_seq=None):
         h = self.backbone(x_flat)
         mean = torch.sigmoid(self.head_mean(h)).squeeze(-1)
         logvar = self.head_logvar(h).squeeze(-1)
         shade_logit = self.head_shade(h).squeeze(-1)
-        width = 0.30 * torch.sigmoid(self.head_width(h)).squeeze(-1)
-        cand_logits = self.head_candidate_logits(h)
-        return mean, logvar, shade_logit, width, cand_logits
+        return mean, logvar, shade_logit
 
 
 class TinyHybridCNN(nn.Module):
-    """NEW CLASS ADDED: tiny 1D-CNN with scalar branch and shared multitask heads."""
+    """PATCH 1 (Option B): tiny 1D-CNN with deterministic candidate generation downstream."""
 
     def __init__(self, scalar_dim: int = 3):
         super().__init__()
@@ -465,8 +468,6 @@ class TinyHybridCNN(nn.Module):
         self.head_mean = nn.Linear(32, 1)
         self.head_logvar = nn.Linear(32, 1)
         self.head_shade = nn.Linear(32, 1)
-        self.head_width = nn.Linear(32, 1)
-        self.head_candidate_logits = nn.Linear(32, 3)
 
     def forward(self, _x_flat, x_scalar, x_seq):
         hs = self.seq_branch(x_seq).flatten(1)
@@ -475,9 +476,7 @@ class TinyHybridCNN(nn.Module):
         mean = torch.sigmoid(self.head_mean(h)).squeeze(-1)
         logvar = self.head_logvar(h).squeeze(-1)
         shade_logit = self.head_shade(h).squeeze(-1)
-        width = 0.30 * torch.sigmoid(self.head_width(h)).squeeze(-1)
-        cand_logits = self.head_candidate_logits(h)
-        return mean, logvar, shade_logit, width, cand_logits
+        return mean, logvar, shade_logit
 
 
 class DriftMonitor:
@@ -512,7 +511,7 @@ class DriftMonitor:
                 exceeded.append(k)
         feature_z = {}
         strong_feature = []
-        for col in ["shade_prob", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement"]:
+        for col in ["shade_prob", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_confidence"]:
             if col in df and col in self.baseline.get("feature_means", {}):
                 mu0 = self.baseline["feature_means"][col]
                 sd0 = max(self.baseline["feature_stds"].get(col, 1e-6), 1e-6)
@@ -537,6 +536,14 @@ class DriftMonitor:
         current["strong_feature_drift"] = strong_feature
         current["drift_metrics_exceeded"] = exceeded
         current["drift_alert"] = bool(enough and (len(exceeded) >= 2 or len(strong_feature) >= 1))
+        reasons = []
+        if len(exceeded) >= 2:
+            reasons.append(f"rate_metrics_exceeded:{','.join(exceeded)}")
+        if len(strong_feature) >= 1:
+            reasons.append(f"strong_feature_drift:{','.join(strong_feature)}")
+        if not reasons:
+            reasons.append("within_threshold")
+        current["drift_decision_reason"] = ";".join(reasons)
         return current
 
 
@@ -575,13 +582,11 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
             yb = torch.tensor(yv_aug[b], device=cfg.device)
             sb = torch.tensor(ys_aug[b], device=cfg.device)
 
-            mu, logvar, slogit, width, cand_logits = model(xb, xs, xq)
+            mu, logvar, slogit = model(xb, xs, xq)
             reg = hetero_regression_loss(yb, mu, logvar).mean()
             cls = F.binary_cross_entropy_with_logits(slogit, sb)
-            width_reg = (width ** 2).mean()
-            cand_ent = (-F.softmax(cand_logits, dim=1) * F.log_softmax(cand_logits, dim=1)).sum(dim=1).mean()
             l2 = sum((p ** 2).sum() for p in model.parameters())
-            loss = reg + cfg.shade_bce_weight * cls + 0.01 * width_reg + 0.002 * cand_ent + cfg.reg_l2_weight * l2
+            loss = reg + cfg.shade_bce_weight * cls + cfg.reg_l2_weight * l2
 
             opt.zero_grad()
             loss.backward()
@@ -594,7 +599,7 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
             xq = torch.tensor(x_seq_va, device=cfg.device)
             yb = torch.tensor(yv_va, device=cfg.device)
             sb = torch.tensor(ys_va, device=cfg.device)
-            mu, logvar, slogit, _, _ = model(xb, xs, xq)
+            mu, logvar, slogit = model(xb, xs, xq)
             reg = hetero_regression_loss(yb, mu, logvar).mean()
             cls = F.binary_cross_entropy_with_logits(slogit, sb)
             vloss = float((reg + cfg.shade_bce_weight * cls).cpu())
@@ -648,28 +653,43 @@ def augment_train_arrays(train_arrays, cfg: Config):
     return xf.astype(np.float32), xs.astype(np.float32), xq.astype(np.float32), yv, ys
 
 
-def model_predict_api(model, flat_n: np.ndarray, scalar_n: np.ndarray, seq_n: np.ndarray, calib: Dict[str, float], cfg: Config):
+def model_predict_api(
+    model,
+    flat_n: np.ndarray,
+    scalar_n: np.ndarray,
+    seq_n: np.ndarray,
+    coarse_best_v_norm: float,
+    oracle_voc: float,
+    oracle_measure_fn,
+    calib: Dict[str, float],
+    cfg: Config,
+):
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(flat_n[None, :], dtype=torch.float32, device=cfg.device)
         xs = torch.tensor(scalar_n[None, :], dtype=torch.float32, device=cfg.device)
         xq = torch.tensor(seq_n[None, :, :], dtype=torch.float32, device=cfg.device)
-        mu, logvar, slogit, width, cand_logits = model(xb, xs, xq)
+        mu, logvar, slogit = model(xb, xs, xq)
         raw_sigma = float(torch.exp(0.5 * logvar).cpu().numpy()[0])
         sigma = float(raw_sigma * calib["sigma_scale"])
         shade_prob = float(torch.sigmoid(slogit).cpu().numpy()[0])
-        width = float(width.cpu().numpy()[0])
-        cand_conf = F.softmax(cand_logits, dim=1).cpu().numpy()[0]
 
     confidence = float(np.clip(1.0 - sigma / (calib["sigma_threshold"] + 1e-9), 0.0, 1.0))
     shade_threshold = float(calib.get("shade_threshold", cfg.shade_prob_threshold))
     v_center = float(np.clip(mu.cpu().numpy()[0], 0.0, 1.0))
-    v_candidates = np.clip(
-        np.array([v_center - width, v_center, v_center + width], dtype=float),
+    v_candidates = np.unique(np.clip(
+        np.array([v_center - 0.08, v_center, 0.5 * (v_center + coarse_best_v_norm), coarse_best_v_norm], dtype=float),
         cfg.sample_fracs_min,
         cfg.sample_fracs_max,
-    ).tolist()
-    cand_confidences = (cand_conf * confidence).tolist()
+    ))
+    pre_refine_powers = np.array([float(vc * oracle_voc * oracle_measure_fn(float(vc * oracle_voc))) for vc in v_candidates], dtype=float)
+    if pre_refine_powers.sum() <= 0:
+        power_term = np.ones_like(pre_refine_powers) / max(len(pre_refine_powers), 1)
+    else:
+        power_term = pre_refine_powers / (pre_refine_powers.sum() + 1e-9)
+    dist_term = 1.0 - np.clip(np.abs(v_candidates - coarse_best_v_norm) / max(cfg.sample_fracs_max - cfg.sample_fracs_min, 1e-9), 0.0, 1.0)
+    cand_scores = (0.50 * confidence) + (0.30 * dist_term) + (0.20 * power_term)
+    cand_confidences = np.clip(cand_scores, 0.0, 1.0).tolist()
     pred = {
         "vhat": v_center,
         "raw_sigma": raw_sigma,
@@ -677,9 +697,10 @@ def model_predict_api(model, flat_n: np.ndarray, scalar_n: np.ndarray, seq_n: np
         "confidence": confidence,
         "shade_prob": shade_prob,
         "shade_flag": int(shade_prob >= shade_threshold),
-        "V_candidates": v_candidates,
+        "V_candidates": v_candidates.tolist(),
         "candidate_confidences": cand_confidences,
         "candidate_disagreement": float(np.std(v_candidates)),
+        "candidate_scores_are_model_predicted": False,
     }
     return pred
 
@@ -691,7 +712,7 @@ def calibrate_uncertainty(model, arrays_cal, cfg: Config) -> Dict[str, float]:
         xb = torch.tensor(x_flat, device=cfg.device)
         xs = torch.tensor(x_scalar, device=cfg.device)
         xq = torch.tensor(x_seq, device=cfg.device)
-        mu, logvar, _, _, _ = model(xb, xs, xq)
+        mu, logvar, _ = model(xb, xs, xq)
         mu = mu.cpu().numpy()
         raw_sigma = np.exp(0.5 * logvar.cpu().numpy())
 
@@ -738,7 +759,7 @@ def calibrate_shade_threshold(model, arrays_cal, cfg: Config) -> Dict[str, float
         xb = torch.tensor(x_flat, device=cfg.device)
         xs = torch.tensor(x_scalar, device=cfg.device)
         xq = torch.tensor(x_seq, device=cfg.device)
-        _, _, slogit, _, _ = model(xb, xs, xq)
+        _, _, slogit = model(xb, xs, xq)
         shade_prob = torch.sigmoid(slogit).cpu().numpy()
     ytrue = ys.astype(int)
     best = {"threshold": cfg.shade_prob_threshold, "precision": 0.0, "recall": 0.0, "f1": 0.0, "bal_acc": 0.0}
@@ -780,7 +801,7 @@ def uncertainty_diagnostics(model, arrays, calib, cfg: Config) -> Dict[str, floa
         xb = torch.tensor(x_flat, device=cfg.device)
         xs = torch.tensor(x_scalar, device=cfg.device)
         xq = torch.tensor(x_seq, device=cfg.device)
-        mu, logvar, _, _, _ = model(xb, xs, xq)
+        mu, logvar, _ = model(xb, xs, xq)
         mu = mu.cpu().numpy()
         sigma = np.exp(0.5 * logvar.cpu().numpy()) * calib["sigma_scale"]
     err = np.abs(mu - yv)
@@ -833,6 +854,53 @@ def refine_local(oracle: CurveOracle, v0: float, cfg: Config):
     return vbest, pbest, hist
 
 
+def build_sparse_features_from_oracle(oracle: CurveOracle, cfg: Config):
+    vq = cfg.sample_fracs * oracle.voc
+    iq = np.array([oracle.measure(v) for v in vq], dtype=float)
+    pq = vq * iq
+    voc = oracle.voc
+    isc = max(oracle.measure(0.0), 1e-12)
+    i_norm = (iq / (isc + 1e-12)).astype(np.float32)
+    p_norm = (pq / (voc * isc + 1e-12)).astype(np.float32)
+    scalar = np.array([voc, isc, voc * isc], dtype=np.float32)
+    seq = np.stack([i_norm, p_norm], axis=0).astype(np.float32)
+    flat = np.concatenate([scalar, i_norm, p_norm], axis=0).astype(np.float32)
+    return vq, iq, pq, flat, scalar, seq
+
+
+def microscan_shade_probability(
+    model,
+    stdz: Dict[str, np.ndarray],
+    oracle: CurveOracle,
+    center_v: float,
+    cfg: Config,
+) -> float:
+    vm = float(np.clip(center_v, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    vl = float(np.clip(vm * (1 - cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    vr = float(np.clip(vm * (1 + cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    p0 = float(vm * oracle.measure(vm))
+    pl = float(vl * oracle.measure(vl))
+    pr = float(vr * oracle.measure(vr))
+    asym = abs(pr - pl) / max(p0, 1e-9)
+    curve = np.array([pl, p0, pr], dtype=np.float32)
+    curve /= max(float(np.max(curve)), 1e-9)
+    scalar = np.array([vm / max(oracle.voc, 1e-9), (pr - pl) / max(p0, 1e-9), asym], dtype=np.float32)
+    interp_axis = np.linspace(0.0, 1.0, 3).astype(np.float32)
+    target_axis = np.linspace(0.0, 1.0, cfg.k_samples).astype(np.float32)
+    micro_i = np.interp(target_axis, interp_axis, curve)
+    micro_p = np.interp(target_axis, interp_axis, curve ** 2)
+    seq = np.stack([micro_i, micro_p], axis=0).astype(np.float32)
+    flat = np.concatenate([scalar, micro_i, micro_p], axis=0).astype(np.float32)
+    flat_n, scalar_n, seq_n = apply_standardizer(flat[None, :], scalar[None, :], seq[None, :, :], stdz)
+    model.eval()
+    with torch.no_grad():
+        xb = torch.tensor(flat_n, dtype=torch.float32, device=cfg.device)
+        xs = torch.tensor(scalar_n, dtype=torch.float32, device=cfg.device)
+        xq = torch.tensor(seq_n, dtype=torch.float32, device=cfg.device)
+        _, _, slogit = model(xb, xs, xq)
+    return float(torch.sigmoid(slogit).cpu().numpy()[0])
+
+
 def run_deterministic_baseline(oracle: CurveOracle, cfg: Config) -> Dict[str, float]:
     vq = cfg.sample_fracs * oracle.voc
     pq = np.array([v * oracle.measure(v) for v in vq], dtype=float)
@@ -883,34 +951,37 @@ def run_hybrid_ml_controller(
     v_curr = float(runtime_state.get("v_operating", 0.72 * oracle.voc))
     v_curr = float(np.clip(v_curr, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
 
-    # -------- PATCH 1: runtime mode scheduler (LOCAL_TRACK -> SHADE_GMPPT only on trigger) --------
+    # -------- PATCH 2: runtime mode scheduler with ML micro-scan shade detection --------
     local_v, local_p, _ = refine_local(oracle, v_curr, cfg)
     local_left = float(np.clip(local_v * (1 - cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
     local_right = float(np.clip(local_v * (1 + cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
     p_left = float(local_left * oracle.measure(local_left))
     p_right = float(local_right * oracle.measure(local_right))
     local_spread = abs(p_right - p_left) / max(local_p, 1e-9)
-    shade_prob_local = float(np.clip(1.5 * local_spread, 0.0, 1.0))
+    shade_prob_micro = microscan_shade_probability(model, stdz, oracle, local_v, cfg)
 
     prev_p = float(runtime_state.get("last_power", local_p))
     anomaly_trigger = int(local_p < cfg.anomaly_drop_ratio * max(prev_p, 1e-9))
     periodic_safety_trigger = int((episode_idx + 1) % max(cfg.periodic_safety_interval, 1) == 0)
-    shade_trigger = int(shade_prob_local >= calib.get("shade_threshold", cfg.shade_prob_threshold))
-    enter_shade_mode = bool(shade_trigger or periodic_safety_trigger or anomaly_trigger)
+    shade_trigger_ml = int(shade_prob_micro >= calib.get("shade_threshold", cfg.shade_prob_threshold))
+    shade_trigger_heuristic = int(np.clip(1.5 * local_spread, 0.0, 1.0) >= calib.get("shade_threshold", cfg.shade_prob_threshold))
+    enter_shade_mode = bool(shade_trigger_ml or periodic_safety_trigger or anomaly_trigger)
     mode = "SHADE_GMPPT" if enter_shade_mode else "LOCAL_TRACK"
 
     # local deterministic reference used for strict verify gate
     ref_v, ref_p, _ = refine_local(oracle, local_v, cfg)
     vbest, pbest = ref_v, ref_p
     pred = {
-        "confidence": 1.0 - 0.5 * shade_prob_local,
+        "vhat": local_v / max(oracle.voc, 1e-9),
+        "confidence": 1.0 - 0.5 * shade_prob_micro,
         "sigma": 0.0,
         "raw_sigma": 0.0,
-        "shade_flag": shade_trigger,
-        "shade_prob": shade_prob_local,
+        "shade_flag": shade_trigger_ml,
+        "shade_prob": shade_prob_micro,
         "V_candidates": [local_v / max(oracle.voc, 1e-9)],
-        "candidate_confidences": [1.0 - shade_prob_local],
+        "candidate_confidences": [1.0 - shade_prob_micro],
         "candidate_disagreement": 0.0,
+        "candidate_scores_are_model_predicted": False,
     }
     coarse_multipeak = 0
     low_confidence = 0
@@ -927,28 +998,42 @@ def run_hybrid_ml_controller(
 
     if enter_shade_mode:
         # Full 12-point scan + ML candidate interface executed only in SHADE_GMPPT mode.
-        vq = cfg.sample_fracs * oracle.voc
-        iq = np.array([oracle.measure(v) for v in vq], dtype=float)
-        pq = vq * iq
+        vq, iq, pq, flat, scalar, seq = build_sparse_features_from_oracle(oracle, cfg)
         coarse_best_idx = int(np.argmax(pq))
         coarse_best_v = float(vq[coarse_best_idx])
         coarse_best_p = float(pq[coarse_best_idx])
         coarse_multipeak = int(count_local_maxima(pq, 0.02) >= 2)
-        voc = oracle.voc
-        isc = max(oracle.measure(0.0), 1e-12)
-        i_norm = (iq / (isc + 1e-12)).astype(np.float32)
-        p_norm = (pq / (voc * isc + 1e-12)).astype(np.float32)
-        scalar = np.array([voc, isc, voc * isc], dtype=np.float32)
-        seq = np.stack([i_norm, p_norm], axis=0).astype(np.float32)
-        flat = np.concatenate([scalar, i_norm, p_norm], axis=0).astype(np.float32)
         flat_n, scalar_n, seq_n = apply_standardizer(flat[None, :], scalar[None, :], seq[None, :, :], stdz)
-        pred = model_predict_api(model, flat_n[0], scalar_n[0], seq_n[0], calib, cfg)
+        pred = model_predict_api(
+            model,
+            flat_n[0],
+            scalar_n[0],
+            seq_n[0],
+            coarse_best_v_norm=(coarse_best_v / max(oracle.voc, 1e-9)),
+            oracle_voc=oracle.voc,
+            oracle_measure_fn=oracle.measure,
+            calib=calib,
+            cfg=cfg,
+        )
         low_confidence = int(pred["sigma"] >= calib["sigma_threshold"])
+        cand_conf = np.array(pred["candidate_confidences"], dtype=float)
+        mean_cand_conf = float(np.mean(cand_conf)) if len(cand_conf) else 0.0
+        min_cand_conf = float(np.min(cand_conf)) if len(cand_conf) else 0.0
+        max_cand_conf = float(np.max(cand_conf)) if len(cand_conf) else 0.0
 
         cand_vs = [float(np.clip(vc * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc)) for vc in pred["V_candidates"]]
-        pre_powers = [float(v * oracle.measure(v)) for v in cand_vs]
-        refined = [refine_local(oracle, c, cfg) for c in cand_vs]
-        post_powers = [float(r[1]) for r in refined]
+        if mean_cand_conf < cfg.candidate_conf_threshold:
+            fallback = 1
+            fallback_reason = "candidate_confidence_below_threshold"
+            candidate_reject_reason = "candidate_confidence_below_threshold"
+            candidate_accept = 0
+            pre_powers = []
+            post_powers = []
+            refined = []
+        else:
+            pre_powers = [float(v * oracle.measure(v)) for v in cand_vs]
+            refined = [refine_local(oracle, c, cfg) for c in cand_vs]
+            post_powers = [float(r[1]) for r in refined]
         best_candidate_index = int(np.argmax(post_powers)) if len(post_powers) else -1
         if best_candidate_index >= 0:
             best_candidate_pre_refine_power = float(pre_powers[best_candidate_index])
@@ -956,31 +1041,36 @@ def run_hybrid_ml_controller(
             vbest = float(refined[best_candidate_index][0])
             pbest = float(refined[best_candidate_index][1])
 
-        candidate_accept = int(
-            best_candidate_post_refine_power >= cfg.candidate_accept_ratio_threshold * ref_p and low_confidence == 0
-        )
-        candidate_reject_reason = "accepted"
-        if candidate_accept == 0:
-            if low_confidence:
-                candidate_reject_reason = "low_confidence_candidates"
-            elif best_candidate_post_refine_power < cfg.candidate_accept_ratio_threshold * ref_p:
-                candidate_reject_reason = "candidate_not_better_than_reference"
-            else:
-                candidate_reject_reason = "candidate_refine_failed"
-            fallback = 1
-            fallback_reason = f"candidate_reject:{candidate_reject_reason}"
+        if fallback == 0:
+            candidate_accept = int(
+                best_candidate_post_refine_power >= cfg.candidate_accept_ratio_threshold * ref_p and low_confidence == 0
+            )
+            candidate_reject_reason = "accepted"
+            if candidate_accept == 0:
+                if low_confidence:
+                    candidate_reject_reason = "low_confidence_candidates"
+                elif best_candidate_post_refine_power < cfg.candidate_accept_ratio_threshold * ref_p:
+                    candidate_reject_reason = "candidate_not_better_than_reference"
+                else:
+                    candidate_reject_reason = "candidate_refine_failed"
+                fallback = 1
+                fallback_reason = f"candidate_reject:{candidate_reject_reason}"
 
-        if not np.isfinite(best_candidate_post_refine_power):
+        if fallback == 0 and (not np.isfinite(best_candidate_post_refine_power)):
             fallback, fallback_reason = 1, "invalid_prediction"
-        if best_candidate_pre_refine_power < cfg.fallback_sanity_ratio * coarse_best_p:
+        if fallback == 0 and best_candidate_pre_refine_power < cfg.fallback_sanity_ratio * coarse_best_p:
             fallback, fallback_reason = 1, "sanity_worse_than_coarse"
             sanity_trigger = 1
-        if pbest < cfg.verify_ratio_threshold * coarse_best_p and fallback_reason == "none":
+        if fallback == 0 and pbest < cfg.verify_ratio_threshold * coarse_best_p and fallback_reason == "none":
             fallback, fallback_reason = 1, "refine_not_better_than_coarse"
-        if coarse_multipeak and pred["confidence"] < cfg.weak_conf_for_multipeak and fallback_reason == "none":
+        if fallback == 0 and coarse_multipeak and pred["confidence"] < cfg.weak_conf_for_multipeak and fallback_reason == "none":
             fallback, fallback_reason = 1, "multipeak_weak_confidence"
-        if pred["confidence"] < cfg.low_conf_widen_threshold and fallback_reason == "none":
+        if fallback == 0 and pred["confidence"] < cfg.low_conf_widen_threshold and fallback_reason == "none":
             fallback, fallback_reason = 1, "low_global_confidence"
+    else:
+        mean_cand_conf = float(np.mean(pred["candidate_confidences"]))
+        min_cand_conf = float(np.min(pred["candidate_confidences"]))
+        max_cand_conf = float(np.max(pred["candidate_confidences"]))
 
     if fallback:
         vscan = np.linspace(0.10 * oracle.voc, 0.95 * oracle.voc, cfg.widen_scan_steps)
@@ -1015,7 +1105,14 @@ def run_hybrid_ml_controller(
         "best_candidate_post_refine_power": float(best_candidate_post_refine_power),
         "periodic_safety_trigger": periodic_safety_trigger,
         "anomaly_trigger": anomaly_trigger,
-        "local_shade_trigger": shade_trigger,
+        "local_shade_trigger_ml": shade_trigger_ml,
+        "local_shade_trigger_heuristic": shade_trigger_heuristic,
+        "local_spread": float(local_spread),
+        "mean_candidate_confidence": float(mean_cand_conf),
+        "candidate_confidence_min": float(min_cand_conf),
+        "candidate_confidence_max": float(max_cand_conf),
+        "used_ml_candidates": int(enter_shade_mode and (fallback == 0)),
+        "used_fallback_scan": int(fallback),
         "candidate_disagreement": float(pred.get("candidate_disagreement", 0.0)),
         "norm_vhat_coarse_gap": float(abs((pred["vhat"] * oracle.voc) - coarse_best_v) / max(oracle.voc, 1e-9)) if enter_shade_mode else 0.0,
     }
@@ -1103,6 +1200,9 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
         "dense_true_multipeak_count": int(df["dense_peak_count"].sum()),
         "shade_gmppt_mode_rate": mode_sha,
         "candidate_accept_rate": cand_accept,
+        "mean_candidate_confidence": float(df["mean_candidate_confidence"].mean()) if "mean_candidate_confidence" in df else np.nan,
+        "used_ml_candidates_rate": float(df["used_ml_candidates"].mean()) if "used_ml_candidates" in df else np.nan,
+        "used_fallback_scan_rate": float(df["used_fallback_scan"].mean()) if "used_fallback_scan" in df else np.nan,
     }
 
 
@@ -1180,21 +1280,38 @@ def profile_model_compute(model, sample_flat, sample_scalar, sample_seq, cfg: Co
         xq = torch.tensor(sample_seq, dtype=torch.float32, device=cfg.device)
         for _ in range(n_runs):
             if cfg.device == "cuda":
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
                 torch.cuda.synchronize()
-            t0 = pd.Timestamp.utcnow().value
-            _ = model(xb, xs, xq)
-            if cfg.device == "cuda":
+                start_evt.record()
+                _ = model(xb, xs, xq)
+                end_evt.record()
                 torch.cuda.synchronize()
-            t1 = pd.Timestamp.utcnow().value
-            times.append((t1 - t0) / 1e9)
+                times.append(float(start_evt.elapsed_time(end_evt) / 1e3))
+            else:
+                t0 = time.perf_counter()
+                _ = model(xb, xs, xq)
+                t1 = time.perf_counter()
+                times.append(float(t1 - t0))
+    avg_batch = float(np.mean(times))
+    p95_batch = float(np.quantile(times, 0.95))
+    max_batch = float(np.max(times))
+    n_samples = max(len(sample_flat), 1)
+    avg_sample = avg_batch / n_samples
+    p95_sample = p95_batch / n_samples
+    max_sample = max_batch / n_samples
     return {
         "parameter_count": n_params,
         "model_size_fp32_bytes": fp32_bytes,
         "model_size_int8_bytes": int8_bytes,
-        "avg_inference_time_sec_per_batch": float(np.mean(times)),
-        "max_inference_time_sec_per_batch": float(np.max(times)),
-        "avg_inference_time_sec_per_sample": float(np.mean(times) / max(len(sample_flat), 1)),
-        "max_inference_time_sec_per_sample": float(np.max(times) / max(len(sample_flat), 1)),
+        "avg_inference_time_sec_per_batch": avg_batch,
+        "p95_inference_time_sec_per_batch": p95_batch,
+        "max_inference_time_sec_per_batch": max_batch,
+        "avg_inference_time_sec_per_sample": avg_sample,
+        "p95_inference_time_sec_per_sample": p95_sample,
+        "max_inference_time_sec_per_sample": max_sample,
+        "meets_pdf_latency_target": bool(max_sample <= cfg.preferred_compute_latency_threshold_sec),
+        "meets_relaxed_research_latency_target": bool(max_sample <= cfg.relaxed_compute_latency_threshold_sec),
     }
 
 
@@ -1363,7 +1480,7 @@ df_mlp_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=mlp, stdz=std
 df_cnn_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
 
 def build_drift_baseline(df_ctrl: pd.DataFrame):
-    feature_cols = ["shade_prob", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement"]
+    feature_cols = ["shade_prob", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_confidence"]
     return {
         "rate_means": {
             "avg_sigma": float(df_ctrl["sigma_vhat"].mean()),
@@ -1375,6 +1492,10 @@ def build_drift_baseline(df_ctrl: pd.DataFrame):
         "feature_means": {c: float(df_ctrl[c].mean()) for c in feature_cols if c in df_ctrl},
         "feature_stds": {c: float(max(df_ctrl[c].std(ddof=0), 1e-6)) for c in feature_cols if c in df_ctrl},
         "fallback_reason_hist": df_ctrl["fallback_reason"].value_counts(normalize=True).to_dict(),
+        "mean_candidate_confidence_baseline": float(df_ctrl["mean_candidate_confidence"].mean()) if "mean_candidate_confidence" in df_ctrl else np.nan,
+        "candidate_disagreement_baseline": float(df_ctrl["candidate_disagreement"].mean()) if "candidate_disagreement" in df_ctrl else np.nan,
+        "sigma_vhat_baseline": float(df_ctrl["sigma_vhat"].mean()) if "sigma_vhat" in df_ctrl else np.nan,
+        "fallback_reason_hist_baseline": df_ctrl["fallback_reason"].value_counts(normalize=True).to_dict(),
     }
 
 drift_baseline_mlp = build_drift_baseline(df_mlp_cal)
@@ -1391,7 +1512,7 @@ drift_summary = {"mlp": drift_summary_mlp, "cnn": drift_summary_cnn}
 print("\n=== 11) drift monitor summary ===")
 print(drift_summary)
 
-# PATCH 9: recommendation grounded on shaded-only performance + deployability gates
+# PATCH 4 + PATCH 8: strict recommendation layering (research vs industry-ready)
 def _safe_metric(d, k, default=np.nan):
     return float(d[k]) if isinstance(d, dict) and (k in d) else float(default)
 
@@ -1437,7 +1558,33 @@ nonsh_no_harm = (not np.isfinite(pref_nonsh_delta)) or (pref_nonsh_delta >= -cfg
 nonsh_false_trigger_gate = (not np.isfinite(pref_false_trigger)) or (pref_false_trigger <= 0.05)
 ml_worth_it = bool(beats_det and no_catastrophic_p99)
 compute_feasible = True  # replaced after compute profiling block
-deployable = bool(no_catastrophic_p99 and acceptable_fallback and drift_clear and beats_det and nonsh_no_harm and nonsh_false_trigger_gate)
+dynamic_proxy_eff = np.nan
+static_proxy_eff = _safe_metric(pref_metrics, "average_tracking_efficiency", np.nan)
+static_efficiency_gate = "proxy_only"
+dynamic_efficiency_gate = "proxy_only"
+hil_validated = False
+
+research_recommended = bool(
+    beats_det
+    and no_catastrophic_p99
+    and acceptable_fallback
+    and nonsh_no_harm
+    and nonsh_false_trigger_gate
+)
+strict_gates = {
+    "shaded_gain_vs_baseline_gt_zero": bool(pref_gain > 0.0),
+    "nonshaded_no_harm_gate": bool(nonsh_no_harm),
+    "false_trigger_gate": bool(nonsh_false_trigger_gate),
+    "p99_vdiff_gate": bool(no_catastrophic_p99),
+    "fallback_gate": bool(acceptable_fallback),
+    "drift_clear": bool(drift_clear),
+    "compute_feasible": bool(compute_feasible),
+    "static_efficiency_gate": static_efficiency_gate,
+    "dynamic_efficiency_gate": dynamic_efficiency_gate,
+    "hil_validated": bool(hil_validated),
+}
+industry_ready = False
+deployable = bool(industry_ready if not cfg.research_only_mode else research_recommended)
 final_recommendation = {
     "ml_worth_it": ml_worth_it,
     "preferred_model": preferred_model,
@@ -1452,11 +1599,19 @@ final_recommendation = {
     "p99_vdiff_non_shaded_preferred": float(pref_nonsh_v99) if np.isfinite(pref_nonsh_v99) else np.nan,
     "drift_clear": bool(drift_clear),
     "compute_feasible": bool(compute_feasible),
+    "static_efficiency_proxy": float(static_proxy_eff) if np.isfinite(static_proxy_eff) else np.nan,
+    "dynamic_transition_proxy_efficiency": float(dynamic_proxy_eff) if np.isfinite(dynamic_proxy_eff) else np.nan,
+    "static_efficiency_gate": static_efficiency_gate,
+    "dynamic_efficiency_gate": dynamic_efficiency_gate,
+    "hil_validated": bool(hil_validated),
+    "strict_gate_status": strict_gates,
+    "research_recommended": bool(research_recommended),
+    "industry_ready": bool(industry_ready),
     "deployable": deployable,
-    "note": "Deterministic fallback remains final authority; ML is advisory only.",
+    "note": "Deterministic fallback remains final authority; dynamic/static standards gates are proxy_only until IEC/EN+HIL validation.",
 }
 
-print("\n=== 12) final recommendation ===")
+print("\n=== 12) preliminary recommendation (updated after dynamic + compute gates) ===")
 print(final_recommendation)
 
 # PATCH 10: benchmark-safe reporting blocks
@@ -1492,11 +1647,18 @@ print({
     "drift_alert": bool(drift_summary_mlp.get("drift_alert", False) or drift_summary_cnn.get("drift_alert", False)),
 })
 
-# PATCH 5: dynamic transition stress harness
-dynamic_transition_report_mlp = evaluate_dynamic_scenarios(exp_test_rows, model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
-dynamic_transition_report_cnn = evaluate_dynamic_scenarios(exp_test_rows, model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
-print("\n=== E) dynamic transition stress report ===")
-print({"mlp": dynamic_transition_report_mlp, "cnn": dynamic_transition_report_cnn})
+# PATCH 6: dynamic reporting (proxy separated from standards-grade validation)
+dynamic_transition_proxy_report_mlp = evaluate_dynamic_scenarios(exp_test_rows, model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
+dynamic_transition_proxy_report_cnn = evaluate_dynamic_scenarios(exp_test_rows, model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
+standards_dynamic_energy_report = {
+    "validated": False,
+    "status": "not_validated",
+    "reason": "Real irradiance-ramp energy traces / HIL traces not supplied.",
+}
+print("\n=== E) dynamic transition proxy report ===")
+print({"mlp": dynamic_transition_proxy_report_mlp, "cnn": dynamic_transition_proxy_report_cnn})
+print("\n=== E2) standards dynamic energy report ===")
+print(standards_dynamic_energy_report)
 
 # PATCH 6: standards / HIL-ready reporting hooks
 standards_reporting = {
@@ -1506,7 +1668,8 @@ standards_reporting = {
     },
     "dynamic_irradiance_ramp_profile": {
         "placeholder": "Populate with standardized irradiance ramp lab data.",
-        "current_proxy": {"mlp": dynamic_transition_report_mlp, "cnn": dynamic_transition_report_cnn},
+        "current_proxy": {"mlp": dynamic_transition_proxy_report_mlp, "cnn": dynamic_transition_proxy_report_cnn},
+        "standards_dynamic_energy_report": standards_dynamic_energy_report,
     },
     "shading_suite_profile": {
         "placeholder": "Populate with certification shading suite traces.",
@@ -1520,7 +1683,7 @@ standards_reporting = {
 print("\n=== F) standards & HIL reporting hooks ===")
 print(standards_reporting)
 
-# PATCH 8: compute/deployability profiling
+# PATCH 5: compute/deployability profiling with perf_counter / CUDA events
 prof_batch = min(32, len(exp_test_flat_n))
 if prof_batch <= 0:
     prof_batch = 1
@@ -1532,11 +1695,56 @@ deployability_table = pd.DataFrame([
     {"model": "hybrid_mlp", **compute_profile["hybrid_mlp"]},
     {"model": "hybrid_cnn", **compute_profile["hybrid_cnn"]},
 ])
-compute_feasible = bool((deployability_table["max_inference_time_sec_per_sample"] < 0.01).all())
+compute_feasible = bool((deployability_table["max_inference_time_sec_per_sample"] <= cfg.relaxed_compute_latency_threshold_sec).all())
 final_recommendation["compute_feasible"] = compute_feasible
-final_recommendation["deployable"] = bool(final_recommendation["deployable"] and compute_feasible)
+final_recommendation["meets_pdf_latency_target"] = bool((deployability_table["max_inference_time_sec_per_sample"] <= cfg.preferred_compute_latency_threshold_sec).all())
+final_recommendation["meets_relaxed_research_latency_target"] = bool((deployability_table["max_inference_time_sec_per_sample"] <= cfg.relaxed_compute_latency_threshold_sec).all())
 print("\n=== G) compute deployability table ===")
 display(deployability_table)
+
+# PATCH 4 + PATCH 8: finalize strict gating after dynamic/compute reports are available
+dynamic_pref = dynamic_transition_proxy_report_mlp if preferred_model == "hybrid_mlp" else dynamic_transition_proxy_report_cnn
+dynamic_proxy_scores = [float(v.get("average_power_ratio", np.nan)) for v in dynamic_pref.values()] if isinstance(dynamic_pref, dict) else []
+dynamic_proxy_eff = float(np.nanmean(dynamic_proxy_scores)) if len(dynamic_proxy_scores) else np.nan
+static_proxy_eff = float(final_recommendation.get("static_efficiency_proxy", np.nan))
+has_true_standard_static = False
+has_true_standard_dynamic = bool(standards_dynamic_energy_report.get("validated", False))
+static_efficiency_gate = bool(static_proxy_eff >= cfg.static_efficiency_threshold) if has_true_standard_static else "proxy_only"
+dynamic_efficiency_gate = bool(dynamic_proxy_eff >= cfg.dynamic_efficiency_threshold) if has_true_standard_dynamic else "proxy_only"
+hil_validated = False
+industry_ready = bool(
+    final_recommendation["shaded_gain_vs_baseline"] > 0.0
+    and final_recommendation["nonshaded_delta_vs_baseline"] >= -cfg.nonshaded_no_harm_tolerance
+    and final_recommendation["false_trigger_rate_non_shaded_preferred"] <= 0.05
+    and final_recommendation["p99_vdiff_preferred"] <= 20.0
+    and final_recommendation["fallback_rate_preferred"] <= 0.35
+    and final_recommendation["drift_clear"] is True
+    and final_recommendation["compute_feasible"] is True
+    and static_efficiency_gate is True
+    and dynamic_efficiency_gate is True
+    and hil_validated is True
+)
+deployable = bool(industry_ready if not cfg.research_only_mode else final_recommendation["research_recommended"])
+final_recommendation["dynamic_transition_proxy_efficiency"] = dynamic_proxy_eff
+final_recommendation["static_efficiency_gate"] = static_efficiency_gate
+final_recommendation["dynamic_efficiency_gate"] = dynamic_efficiency_gate
+final_recommendation["hil_validated"] = hil_validated
+final_recommendation["industry_ready"] = industry_ready
+final_recommendation["deployable"] = deployable
+final_recommendation["strict_gate_status"] = {
+    "shaded_gain_vs_baseline_gt_zero": bool(final_recommendation["shaded_gain_vs_baseline"] > 0.0),
+    "nonshaded_no_harm_gate": bool(final_recommendation["nonshaded_delta_vs_baseline"] >= -cfg.nonshaded_no_harm_tolerance),
+    "false_trigger_gate": bool(final_recommendation["false_trigger_rate_non_shaded_preferred"] <= 0.05),
+    "p99_vdiff_gate": bool(final_recommendation["p99_vdiff_preferred"] <= 20.0),
+    "fallback_gate": bool(final_recommendation["fallback_rate_preferred"] <= 0.35),
+    "drift_clear": bool(final_recommendation["drift_clear"]),
+    "compute_feasible": bool(final_recommendation["compute_feasible"]),
+    "static_efficiency_gate": static_efficiency_gate,
+    "dynamic_efficiency_gate": dynamic_efficiency_gate,
+    "hil_validated": bool(hil_validated),
+}
+print("\n=== H) final recommendation (strict deployability gates) ===")
+print(final_recommendation)
 
 if MAKE_PLOTS:
     plt.figure(figsize=(7, 4))
@@ -1575,7 +1783,8 @@ if SAVE_MODEL_BUNDLE:
             "nonshaded_ratio_delta_cnn": nonsh_ratio_delta_cnn,
         },
         "comparison_table": comparison_df.to_dict(orient="records"),
-        "dynamic_transition_report": {"mlp": dynamic_transition_report_mlp, "cnn": dynamic_transition_report_cnn},
+        "dynamic_transition_proxy_report": {"mlp": dynamic_transition_proxy_report_mlp, "cnn": dynamic_transition_proxy_report_cnn},
+        "standards_dynamic_energy_report": standards_dynamic_energy_report,
         "standards_reporting_hooks": standards_reporting,
         "compute_profiling_summary": compute_profile,
         "final_recommendation": final_recommendation,
