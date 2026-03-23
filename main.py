@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # =========================
 # SINGLE-CELL COLAB NOTEBOOK SCRIPT
 # Hybrid deterministic-first GMPPT with ML advisory blocks (MLP + tiny 1D-CNN)
@@ -1074,7 +1076,7 @@ def calibrate_local_shade_trigger_threshold(y_true: np.ndarray, y_score: np.ndar
 
 
 def runtime_candidate_acceptance_from_prediction(
-    oracle: CurveOracle,
+    oracle: "CurveOracle",
     pred: Dict[str, float],
     coarse_best_v: float,
     coarse_best_p: float,
@@ -1353,7 +1355,7 @@ class CurveOracle:
         return float(max(np.interp(vv, self.v, self.i), 0.0))
 
 
-def refine_local(oracle: CurveOracle, v0: float, cfg: Config):
+def refine_local(oracle: "CurveOracle", v0: float, cfg: Config):
     vbest = float(np.clip(v0, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
     pbest = float(vbest * oracle.measure(vbest))
     delta = cfg.delta_local
@@ -1375,7 +1377,7 @@ def refine_local(oracle: CurveOracle, v0: float, cfg: Config):
     return vbest, pbest, hist
 
 
-def build_sparse_features_from_oracle(oracle: CurveOracle, cfg: Config):
+def build_sparse_features_from_oracle(oracle: "CurveOracle", cfg: Config):
     vq = cfg.sample_fracs * oracle.voc
     iq = np.array([oracle.measure(v) for v in vq], dtype=float)
     pq = vq * iq
@@ -1390,7 +1392,7 @@ def build_sparse_features_from_oracle(oracle: CurveOracle, cfg: Config):
 
 
 def microscan_shade_heuristic_score(
-    oracle: CurveOracle,
+    oracle: "CurveOracle",
     center_v: float,
     cfg: Config,
 ) -> float:
@@ -1408,7 +1410,7 @@ def microscan_shade_heuristic_score(
     return float(np.clip(score, 0.0, 1.0))
 
 
-def sample_local_track_centers(oracle: CurveOracle, cfg: Config) -> List[float]:
+def sample_local_track_centers(oracle: "CurveOracle", cfg: Config) -> List[float]:
     """Sample LOCAL_TRACK centers from short runtime-like rollouts."""
     if oracle.voc <= 0:
         return []
@@ -1447,7 +1449,7 @@ def collect_local_track_runtime_states(rows: List[Dict], cfg: Config) -> List[Di
     return states
 
 
-def build_micro_scan_features(oracle: CurveOracle, center_v: float, cfg: Config) -> Dict[str, float]:
+def build_micro_scan_features(oracle: "CurveOracle", center_v: float, cfg: Config) -> Dict[str, float]:
     """PATCH 1: dedicated micro-scan feature interface for local detector."""
     vm = float(np.clip(center_v, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
     vl = float(np.clip(vm * (1 - cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
@@ -1619,7 +1621,7 @@ finetune_micro_shade_detector = finetune_micro_local_escalation_detector
 calibrate_micro_shade_threshold = calibrate_micro_escalation_threshold
 
 
-def run_deterministic_baseline(oracle: CurveOracle, cfg: Config) -> Dict[str, float]:
+def run_deterministic_baseline(oracle: "CurveOracle", cfg: Config) -> Dict[str, float]:
     vq = cfg.sample_fracs * oracle.voc
     pq = np.array([v * oracle.measure(v) for v in vq], dtype=float)
     b = int(np.argmax(pq))
@@ -1657,7 +1659,7 @@ def run_deterministic_baseline(oracle: CurveOracle, cfg: Config) -> Dict[str, fl
 
 
 def run_hybrid_ml_controller(
-    oracle: CurveOracle,
+    oracle: "CurveOracle",
     model,
     stdz,
     calib,
