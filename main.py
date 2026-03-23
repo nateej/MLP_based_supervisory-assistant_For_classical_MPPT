@@ -72,14 +72,22 @@ class Config:
     fallback_sanity_ratio: float = 0.92
     shade_prob_threshold: float = 0.50
     weak_conf_for_multipeak: float = 0.60
+    verify_ratio_threshold: float = 0.995
 
     # evaluation
+    evaluate_all_test_curves: bool = True
     max_eval_curves: int = 300
     n_viz: int = 6
 
     # drift monitor
     drift_window: int = 64
     drift_tolerance_frac: float = 0.35
+    drift_min_episodes: int = 24
+
+    # training-time augmentation (train-only)
+    aug_noise_std: float = 0.01
+    aug_scale_std: float = 0.015
+    aug_prob: float = 0.60
 
     @property
     def sample_fracs(self) -> np.ndarray:
@@ -458,10 +466,11 @@ class TinyHybridCNN(nn.Module):
 class DriftMonitor:
     """NEW CLASS ADDED: lightweight heuristic drift monitor."""
 
-    def __init__(self, baseline: Dict[str, float], window: int, tol_frac: float):
+    def __init__(self, baseline: Dict[str, float], window: int, tol_frac: float, min_episodes: int = 1):
         self.baseline = baseline
         self.window = int(window)
         self.tol_frac = float(tol_frac)
+        self.min_episodes = int(min_episodes)
         self.buf = []
 
     def update(self, episode_log: Dict[str, float]):
@@ -480,11 +489,12 @@ class DriftMonitor:
             "shade_rate": float(df["shade_flag"].mean()),
             "coarse_multipeak_rate": float(df["coarse_multipeak"].mean()),
         }
-        drift = False
+        exceeded = []
         for k, v0 in self.baseline.items():
             if abs(current[k] - v0) > self.tol_frac * max(abs(v0), 1e-6):
-                drift = True
-        current["drift_alert"] = drift
+                exceeded.append(k)
+        current["drift_metrics_exceeded"] = exceeded
+        current["drift_alert"] = bool(len(self.buf) >= self.min_episodes and len(exceeded) >= 2)
         return current
 
 
@@ -511,16 +521,17 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
 
     for ep in range(1, epochs + 1):
         model.train()
-        idx = np.random.permutation(len(x_flat_tr))
+        x_flat_aug, x_scalar_aug, x_seq_aug, yv_aug, ys_aug = augment_train_arrays(train_arrays, cfg)
+        idx = np.random.permutation(len(x_flat_aug))
         for st in range(0, len(idx), cfg.batch_size):
             b = idx[st:st + cfg.batch_size]
             if len(b) < 2:
                 continue
-            xb = torch.tensor(x_flat_tr[b], device=cfg.device)
-            xs = torch.tensor(x_scalar_tr[b], device=cfg.device)
-            xq = torch.tensor(x_seq_tr[b], device=cfg.device)
-            yb = torch.tensor(yv_tr[b], device=cfg.device)
-            sb = torch.tensor(ys_tr[b], device=cfg.device)
+            xb = torch.tensor(x_flat_aug[b], device=cfg.device)
+            xs = torch.tensor(x_scalar_aug[b], device=cfg.device)
+            xq = torch.tensor(x_seq_aug[b], device=cfg.device)
+            yb = torch.tensor(yv_aug[b], device=cfg.device)
+            sb = torch.tensor(ys_aug[b], device=cfg.device)
 
             mu, logvar, slogit = model(xb, xs, xq)
             reg = hetero_regression_loss(yb, mu, logvar).mean()
@@ -559,6 +570,40 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
     return model
 
 
+def augment_train_arrays(train_arrays, cfg: Config):
+    """PATCH 7: lightweight physically-plausible augmentation on TRAIN arrays only."""
+    x_flat, x_scalar, x_seq, yv, ys = train_arrays
+    xf = x_flat.copy()
+    xs = x_scalar.copy()
+    xq = x_seq.copy()
+    n = len(xf)
+    if n == 0:
+        return train_arrays
+
+    mask = np.random.rand(n) < cfg.aug_prob
+    if np.any(mask):
+        idx = np.where(mask)[0]
+        # seq noise: i_norm and p_norm
+        xq[idx] += np.random.normal(0.0, cfg.aug_noise_std, size=xq[idx].shape).astype(np.float32)
+        xq[idx] = np.clip(xq[idx], 0.0, 1.25).astype(np.float32)
+
+        # scalar multiplicative scaling + small Voc/Isc perturbations
+        s_scale = (1.0 + np.random.normal(0.0, cfg.aug_scale_std, size=(len(idx), 1))).astype(np.float32)
+        xs[idx] = np.clip(xs[idx] * s_scale, -8.0, 8.0).astype(np.float32)
+
+        # optional sparse-point dropout (one or two indices)
+        for ii in idx:
+            drop_k = 1 if np.random.rand() < 0.75 else 2
+            drop_idx = np.random.choice(cfg.k_samples, size=drop_k, replace=False)
+            xq[ii, :, drop_idx] *= np.float32(1.0 - np.random.uniform(0.02, 0.10))
+
+        # rebuild flat tail from augmented sequence while keeping scalar prefix
+        xf[:, 3:3 + cfg.k_samples] = xq[:, 0, :]
+        xf[:, 3 + cfg.k_samples:3 + 2 * cfg.k_samples] = xq[:, 1, :]
+
+    return xf.astype(np.float32), xs.astype(np.float32), xq.astype(np.float32), yv, ys
+
+
 def model_predict_api(model, flat_n: np.ndarray, scalar_n: np.ndarray, seq_n: np.ndarray, calib: Dict[str, float], cfg: Config):
     model.eval()
     with torch.no_grad():
@@ -571,13 +616,14 @@ def model_predict_api(model, flat_n: np.ndarray, scalar_n: np.ndarray, seq_n: np
         shade_prob = float(torch.sigmoid(slogit).cpu().numpy()[0])
 
     confidence = float(np.clip(1.0 - sigma / (calib["sigma_threshold"] + 1e-9), 0.0, 1.0))
+    shade_threshold = float(calib.get("shade_threshold", cfg.shade_prob_threshold))
     pred = {
         "vhat": float(np.clip(mu.cpu().numpy()[0], 0.0, 1.0)),
         "raw_sigma": raw_sigma,
         "sigma": sigma,
         "confidence": confidence,
         "shade_prob": shade_prob,
-        "shade_flag": int(shade_prob >= cfg.shade_prob_threshold),
+        "shade_flag": int(shade_prob >= shade_threshold),
     }
     return pred
 
@@ -625,6 +671,49 @@ def calibrate_uncertainty(model, arrays_cal, cfg: Config) -> Dict[str, float]:
         "f1": best["f1"],
         "abs_err_mean": float(abs_err.mean()),
         "abs_err_p95": float(np.quantile(abs_err, 0.95)),
+    }
+
+
+def calibrate_shade_threshold(model, arrays_cal, cfg: Config) -> Dict[str, float]:
+    """PATCH 3: calibration-driven shade threshold selection (safety-oriented)."""
+    x_flat, x_scalar, x_seq, _yv, ys = arrays_cal
+    model.eval()
+    with torch.no_grad():
+        xb = torch.tensor(x_flat, device=cfg.device)
+        xs = torch.tensor(x_scalar, device=cfg.device)
+        xq = torch.tensor(x_seq, device=cfg.device)
+        _, _, slogit = model(xb, xs, xq)
+        shade_prob = torch.sigmoid(slogit).cpu().numpy()
+    ytrue = ys.astype(int)
+    best = {"threshold": cfg.shade_prob_threshold, "precision": 0.0, "recall": 0.0, "f1": 0.0, "bal_acc": 0.0}
+    for th in np.linspace(0.1, 0.9, 17):
+        yhat = (shade_prob >= th).astype(int)
+        tp = int(np.sum((yhat == 1) & (ytrue == 1)))
+        fp = int(np.sum((yhat == 1) & (ytrue == 0)))
+        fn = int(np.sum((yhat == 0) & (ytrue == 1)))
+        tn = int(np.sum((yhat == 0) & (ytrue == 0)))
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+        tnr = tn / max(tn + fp, 1)
+        bal_acc = 0.5 * (recall + tnr)
+        # prioritize shaded recall; tie-break by f1 then balanced accuracy
+        curr = (recall, f1, bal_acc)
+        prev = (best["recall"], best["f1"], best["bal_acc"])
+        if curr > prev:
+            best = {
+                "threshold": float(th),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1": float(f1),
+                "bal_acc": float(bal_acc),
+            }
+    return {
+        "shade_threshold": best["threshold"],
+        "shade_precision": best["precision"],
+        "shade_recall": best["recall"],
+        "shade_f1": best["f1"],
+        "shade_bal_acc": best["bal_acc"],
     }
 
 
@@ -759,13 +848,25 @@ def run_hybrid_ml_controller(oracle: CurveOracle, model, stdz, calib, cfg: Confi
     if pred["shade_flag"] == 0 and low_confidence == 0:
         vbest, pbest = refine_local(oracle, coarse_best_v, cfg)[:2]
     else:
-        vbest, pbest = refine_local(oracle, vhat, cfg)[:2]
+        # PATCH 5: multi-candidate verification (vhat, coarse_best_v, midpoint if meaningfully different)
+        candidates = [vhat, coarse_best_v]
+        if abs(vhat - coarse_best_v) > 0.04 * oracle.voc:
+            candidates.append(0.5 * (vhat + coarse_best_v))
+        cand_out = []
+        for c in candidates:
+            rv, rp, _ = refine_local(oracle, c, cfg)
+            cand_out.append((rv, rp))
+        kbest = int(np.argmax([cp[1] for cp in cand_out]))
+        vbest, pbest = cand_out[kbest]
 
     if not np.isfinite(vhat) or not np.isfinite(phat):
         fallback, fallback_reason = 1, "invalid_prediction"
     if phat < cfg.fallback_sanity_ratio * coarse_best_p:
         fallback, fallback_reason = 1, "sanity_worse_than_coarse"
         sanity_trigger = 1
+    # PATCH 4: post-refinement verification separate from pre-refinement sanity gate
+    if pbest < cfg.verify_ratio_threshold * coarse_best_p and fallback_reason == "none":
+        fallback, fallback_reason = 1, "refine_not_better_than_coarse"
     if low_confidence and fallback_reason == "none":
         fallback, fallback_reason = 1, "low_confidence"
     if coarse_multipeak and pred["confidence"] < cfg.weak_conf_for_multipeak and fallback_reason == "none":
@@ -800,18 +901,58 @@ def run_hybrid_ml_controller(oracle: CurveOracle, model, stdz, calib, cfg: Confi
 # -------------------------
 # DATA PREP / SPLITS
 # -------------------------
-def prepare_experimental_splits(exp_rows: List[Dict], cfg: Config):
-    idx = np.arange(len(exp_rows))
-    y_sh = np.array([r["y_shade"] for r in exp_rows], dtype=int)
-    strat = y_sh if len(np.unique(y_sh)) > 1 else None
+def _split_indices_for_finetune_and_cal(rows: List[Dict], cfg: Config):
+    idx = np.arange(len(rows))
+    y = np.array([int(r["y_shade"]) for r in rows], dtype=int)
+    strat = y if len(np.unique(y)) > 1 else None
+    try:
+        idx_ft, idx_cal = train_test_split(idx, test_size=cfg.exp_cal_split, random_state=cfg.seed, stratify=strat)
+    except ValueError:
+        idx_ft, idx_cal = train_test_split(idx, test_size=cfg.exp_cal_split, random_state=cfg.seed, stratify=None)
+    return idx_ft, idx_cal
 
-    idx_train, idx_test = train_test_split(idx, test_size=cfg.exp_test_split, random_state=cfg.seed, stratify=strat)
 
-    y_tr = y_sh[idx_train]
-    strat2 = y_tr if len(np.unique(y_tr)) > 1 else None
-    idx_ft, idx_cal = train_test_split(idx_train, test_size=cfg.exp_cal_split, random_state=cfg.seed, stratify=strat2)
+def prepare_experimental_splits(exp_ok_rows: List[Dict], exp_sh_rows: List[Dict], cfg: Config):
+    """PATCH 1: enforce shaded-only held-out test whenever shaded experimental curves exist."""
+    exp_ok_rows = list(exp_ok_rows)
+    exp_sh_rows = list(exp_sh_rows)
 
-    return idx_ft, idx_cal, idx_test
+    if len(exp_sh_rows) > 0:
+        sh_idx = np.arange(len(exp_sh_rows))
+        sh_train_idx, sh_test_idx = train_test_split(sh_idx, test_size=cfg.exp_test_split, random_state=cfg.seed, stratify=None)
+        ft_cal_rows = exp_ok_rows + [exp_sh_rows[i] for i in sh_train_idx]
+        idx_ft, idx_cal = _split_indices_for_finetune_and_cal(ft_cal_rows, cfg)
+        exp_ft_rows = [ft_cal_rows[i] for i in idx_ft]
+        exp_cal_rows = [ft_cal_rows[i] for i in idx_cal]
+        exp_test_rows = [exp_sh_rows[i] for i in sh_test_idx]
+        test_set_mode = "shaded_only"
+    else:
+        exp_rows = exp_ok_rows
+        idx = np.arange(len(exp_rows))
+        y_sh = np.array([r["y_shade"] for r in exp_rows], dtype=int)
+        strat = y_sh if len(np.unique(y_sh)) > 1 else None
+        try:
+            idx_train, idx_test = train_test_split(idx, test_size=cfg.exp_test_split, random_state=cfg.seed, stratify=strat)
+        except ValueError:
+            idx_train, idx_test = train_test_split(idx, test_size=cfg.exp_test_split, random_state=cfg.seed, stratify=None)
+        y_tr = y_sh[idx_train]
+        strat2 = y_tr if len(np.unique(y_tr)) > 1 else None
+        try:
+            idx_ft, idx_cal = train_test_split(idx_train, test_size=cfg.exp_cal_split, random_state=cfg.seed, stratify=strat2)
+        except ValueError:
+            idx_ft, idx_cal = train_test_split(idx_train, test_size=cfg.exp_cal_split, random_state=cfg.seed, stratify=None)
+        exp_ft_rows = [exp_rows[i] for i in idx_ft]
+        exp_cal_rows = [exp_rows[i] for i in idx_cal]
+        exp_test_rows = [exp_rows[i] for i in idx_test]
+        test_set_mode = "mixed_experimental"
+
+    return {
+        "exp_ft_rows": exp_ft_rows,
+        "exp_cal_rows": exp_cal_rows,
+        "exp_test_rows": exp_test_rows,
+        "test_set_mode": test_set_mode,
+        "heldout_shaded_count": int(sum(int(r["y_shade"]) == 1 for r in exp_test_rows)),
+    }
 
 
 def rows_to_arrays(rows: List[Dict]):
@@ -840,7 +981,8 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
 
 def evaluate_controller(rows: List[Dict], mode: str, model=None, stdz=None, calib=None, cfg: Config = cfg):
     records = []
-    for r in rows[: cfg.max_eval_curves]:
+    eval_rows = rows if cfg.evaluate_all_test_curves else rows[: cfg.max_eval_curves]
+    for r in eval_rows:
         oracle = CurveOracle(r["v_curve"], r["i_curve"])
         if mode == "deterministic":
             out = run_deterministic_baseline(oracle, cfg)
@@ -901,10 +1043,13 @@ if len(exp_rows) == 0:
 if len(sim_rows) == 0 or len(exp_rows) == 0:
     raise RuntimeError("Need valid simulated and experimental curves after cleaning")
 
-idx_ft, idx_cal, idx_test = prepare_experimental_splits(exp_rows, cfg)
-exp_ft_rows = [exp_rows[i] for i in idx_ft]
-exp_cal_rows = [exp_rows[i] for i in idx_cal]
-exp_test_rows = [exp_rows[i] for i in idx_test]
+# PATCH 1: shaded-only held-out enforcement when shaded experimental rows exist
+split_info = prepare_experimental_splits(exp_ok_rows, exp_sh_rows, cfg)
+exp_ft_rows = split_info["exp_ft_rows"]
+exp_cal_rows = split_info["exp_cal_rows"]
+exp_test_rows = split_info["exp_test_rows"]
+test_set_mode = split_info["test_set_mode"]
+heldout_shaded_count = split_info["heldout_shaded_count"]
 
 # standardizer fit on pretraining set
 sim_flat, sim_scalar, sim_seq, sim_yv, sim_ys = rows_to_arrays(sim_rows)
@@ -941,7 +1086,15 @@ print({
 })
 
 print("\n=== 2) split summary ===")
-print({"exp_finetune": len(exp_ft_rows), "exp_calibration": len(exp_cal_rows), "exp_test": len(exp_test_rows)})
+print({
+    "exp_ok_rows": len(exp_ok_rows),
+    "exp_shaded_rows": len(exp_sh_rows),
+    "test_set_mode": test_set_mode,
+    "heldout_shaded_curve_count": heldout_shaded_count,
+    "exp_finetune": len(exp_ft_rows),
+    "exp_calibration": len(exp_cal_rows),
+    "exp_test": len(exp_test_rows),
+})
 
 print("\nTraining MLP staged (sim pretrain -> exp finetune)...")
 mlp = train_multitask_model(mlp, sim_train, sim_val, cfg, stage="pretrain")
@@ -958,6 +1111,10 @@ print(cnn)
 
 mlp_cal = calibrate_uncertainty(mlp, exp_cal_arrays, cfg)
 cnn_cal = calibrate_uncertainty(cnn, exp_cal_arrays, cfg)
+mlp_shade_cal = calibrate_shade_threshold(mlp, exp_cal_arrays, cfg)
+cnn_shade_cal = calibrate_shade_threshold(cnn, exp_cal_arrays, cfg)
+mlp_cal.update(mlp_shade_cal)
+cnn_cal.update(cnn_shade_cal)
 
 print("\n=== 5) uncertainty calibration summary ===")
 print({"mlp": mlp_cal, "cnn": cnn_cal})
@@ -970,6 +1127,10 @@ cnn_flat = uncertainty_diagnostics(cnn, exp_test_arrays, cnn_cal, cfg)
 df_det, met_det = evaluate_controller(exp_test_rows, mode="deterministic", cfg=cfg)
 df_mlp, met_mlp = evaluate_controller(exp_test_rows, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
 df_cnn, met_cnn = evaluate_controller(exp_test_rows, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
+print({
+    "evaluate_all_test_curves": cfg.evaluate_all_test_curves,
+    "n_test_curves_evaluated": len(df_det),
+})
 
 print("\n=== 6) deterministic baseline controller results ===")
 print(met_det)
@@ -991,8 +1152,10 @@ print("\n=== 9) shaded-only held-out comparison ===")
 print({"deterministic": sh_det, "mlp": sh_mlp, "cnn": sh_cnn})
 
 # all-test comparison table
+# PATCH 2: deterministic row must not use MLP regression metrics
+det_flat = {"mae": np.nan, "rmse": np.nan, "p95": np.nan, "p99": np.nan, "mean_sigma": np.nan}
 rows_cmp = [
-    {"method": "deterministic", **mlp_flat, **met_det},
+    {"method": "deterministic", **det_flat, **met_det},
     {"method": "hybrid_mlp", **mlp_flat, **met_mlp},
     {"method": "hybrid_cnn", **cnn_flat, **met_cnn},
 ]
@@ -1006,37 +1169,110 @@ for name, dfx in [("deterministic", df_det), ("hybrid_mlp", df_mlp), ("hybrid_cn
 print("\n=== 10) all-test comparison ===")
 display(comparison_df)
 
-# drift baseline from calibration pass
-base_for_drift = {
-    "avg_sigma": float(np.mean(np.exp(0.5 * np.zeros(len(exp_cal_rows))) * mlp_cal["sigma_scale"])),
-    "fallback_rate": float(df_mlp["fallback"].mean()),
-    "sanity_rate": float(df_mlp["sanity_trigger"].mean()),
-    "shade_rate": float(df_mlp["shade_flag"].mean()),
-    "coarse_multipeak_rate": float(df_mlp["coarse_multipeak"].mean()),
-}
-monitor = DriftMonitor(base_for_drift, window=cfg.drift_window, tol_frac=cfg.drift_tolerance_frac)
-for _, rr in df_mlp.iterrows():
-    monitor.update(rr.to_dict())
+# PATCH 6: true drift baseline from calibration stream, separate test stream monitoring
+df_mlp_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
+df_cnn_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
 
-drift_summary = monitor.summarize()
+def build_drift_baseline(df_ctrl: pd.DataFrame):
+    return {
+        "avg_sigma": float(df_ctrl["sigma_vhat"].mean()),
+        "fallback_rate": float(df_ctrl["fallback"].mean()),
+        "sanity_rate": float(df_ctrl["sanity_trigger"].mean()),
+        "shade_rate": float(df_ctrl["shade_flag"].mean()),
+        "coarse_multipeak_rate": float(df_ctrl["coarse_multipeak"].mean()),
+    }
+
+drift_baseline_mlp = build_drift_baseline(df_mlp_cal)
+drift_baseline_cnn = build_drift_baseline(df_cnn_cal)
+mon_mlp = DriftMonitor(drift_baseline_mlp, window=cfg.drift_window, tol_frac=cfg.drift_tolerance_frac, min_episodes=cfg.drift_min_episodes)
+mon_cnn = DriftMonitor(drift_baseline_cnn, window=cfg.drift_window, tol_frac=cfg.drift_tolerance_frac, min_episodes=cfg.drift_min_episodes)
+for _, rr in df_mlp.iterrows():
+    mon_mlp.update(rr.to_dict())
+for _, rr in df_cnn.iterrows():
+    mon_cnn.update(rr.to_dict())
+drift_summary_mlp = mon_mlp.summarize()
+drift_summary_cnn = mon_cnn.summarize()
+drift_summary = {"mlp": drift_summary_mlp, "cnn": drift_summary_cnn}
 print("\n=== 11) drift monitor summary ===")
 print(drift_summary)
 
-# final recommendation logic on controller behavior
-best_method = "hybrid_mlp" if met_mlp["average_power_ratio"] >= met_cnn["average_power_ratio"] else "hybrid_cnn"
-best_fallback = met_mlp["fallback_rate"] if best_method == "hybrid_mlp" else met_cnn["fallback_rate"]
-ml_worth_it = (max(met_mlp["average_power_ratio"], met_cnn["average_power_ratio"]) - met_det["average_power_ratio"]) > 0.002
+# PATCH 9: recommendation grounded on shaded-only performance + deployability gates
+def _safe_metric(d, k, default=np.nan):
+    return float(d[k]) if isinstance(d, dict) and (k in d) else float(default)
 
+shaded_available = isinstance(sh_mlp, dict) and "average_power_ratio" in sh_mlp
+nonsh_test = [r for r in exp_test_rows if int(r["y_shade"]) == 0]
+if len(nonsh_test) > 0:
+    df_nonsh_mlp, _ = evaluate_controller(nonsh_test, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
+    df_nonsh_cnn, _ = evaluate_controller(nonsh_test, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
+    false_trigger_mlp = float(df_nonsh_mlp["shade_flag"].mean())
+    false_trigger_cnn = float(df_nonsh_cnn["shade_flag"].mean())
+else:
+    false_trigger_mlp = np.nan
+    false_trigger_cnn = np.nan
+
+score_mlp = _safe_metric(sh_mlp, "average_power_ratio", met_mlp["average_power_ratio"])
+score_cnn = _safe_metric(sh_cnn, "average_power_ratio", met_cnn["average_power_ratio"])
+preferred_model = "hybrid_mlp" if score_mlp >= score_cnn else "hybrid_cnn"
+pref_metrics = sh_mlp if preferred_model == "hybrid_mlp" and shaded_available else (sh_cnn if shaded_available else (met_mlp if preferred_model == "hybrid_mlp" else met_cnn))
+pref_drift = drift_summary_mlp if preferred_model == "hybrid_mlp" else drift_summary_cnn
+pref_false_trigger = false_trigger_mlp if preferred_model == "hybrid_mlp" else false_trigger_cnn
+pref_gain = _safe_metric(pref_metrics, "average_power_ratio", np.nan) - _safe_metric(sh_det if shaded_available else met_det, "average_power_ratio", np.nan)
+
+no_catastrophic_p99 = _safe_metric(pref_metrics, "p99_voltage_percent_difference", 999.0) <= 20.0
+acceptable_fallback = _safe_metric(pref_metrics, "fallback_rate", 1.0) <= 0.35
+drift_clear = not bool(pref_drift.get("drift_alert", True))
+beats_det = pref_gain > 0.0
+ml_worth_it = bool(beats_det and no_catastrophic_p99)
+deployable = bool(no_catastrophic_p99 and acceptable_fallback and drift_clear and beats_det)
 final_recommendation = {
-    "ml_worth_it": bool(ml_worth_it),
-    "preferred_model": best_method,
-    "fallback_rate_preferred": float(best_fallback),
-    "deployable": bool(best_fallback < 0.35 and not drift_summary.get("drift_alert", False)),
+    "ml_worth_it": ml_worth_it,
+    "preferred_model": preferred_model,
+    "reason_preferred": "higher_shaded_power_ratio_with_safety_checks",
+    "shaded_gain_vs_baseline": float(pref_gain),
+    "p95_vdiff_preferred": _safe_metric(pref_metrics, "p95_voltage_percent_difference", np.nan),
+    "p99_vdiff_preferred": _safe_metric(pref_metrics, "p99_voltage_percent_difference", np.nan),
+    "fallback_rate_preferred": _safe_metric(pref_metrics, "fallback_rate", np.nan),
+    "false_trigger_rate_non_shaded_preferred": float(pref_false_trigger) if np.isfinite(pref_false_trigger) else np.nan,
+    "deployable": deployable,
     "note": "Deterministic fallback remains final authority; ML is advisory only.",
 }
 
 print("\n=== 12) final recommendation ===")
 print(final_recommendation)
+
+# PATCH 10: benchmark-safe reporting blocks
+n_test_total = len(exp_test_rows)
+n_test_shaded = int(sum(int(r["y_shade"]) == 1 for r in exp_test_rows))
+n_test_ok = int(n_test_total - n_test_shaded)
+fallback_counts_mlp = df_mlp["fallback_reason"].value_counts(dropna=False).to_dict() if len(df_mlp) else {}
+fallback_counts_cnn = df_cnn["fallback_reason"].value_counts(dropna=False).to_dict() if len(df_cnn) else {}
+print("\n=== A) calibration diagnostics ===")
+print({
+    "uncertainty_calibration": {"mlp": mlp_cal, "cnn": cnn_cal},
+    "shade_threshold_calibration": {
+        "mlp": {k: mlp_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
+        "cnn": {k: cnn_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
+    },
+})
+print("\n=== B) test mode summary ===")
+print({
+    "test_set_mode": test_set_mode,
+    "n_test_total": n_test_total,
+    "n_test_shaded": n_test_shaded,
+    "n_test_ok": n_test_ok,
+})
+print("\n=== C) controller robustness ===")
+print({
+    "fallback_reason_counts_mlp": fallback_counts_mlp,
+    "fallback_reason_counts_cnn": fallback_counts_cnn,
+})
+print("\n=== D) drift summary ===")
+print({
+    "baseline_stats": {"mlp": drift_baseline_mlp, "cnn": drift_baseline_cnn},
+    "test_stats": drift_summary,
+    "drift_alert": bool(drift_summary_mlp.get("drift_alert", False) or drift_summary_cnn.get("drift_alert", False)),
+})
 
 if MAKE_PLOTS:
     plt.figure(figsize=(7, 4))
