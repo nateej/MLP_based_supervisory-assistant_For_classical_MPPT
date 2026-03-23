@@ -29,6 +29,7 @@ except Exception:
 # USER CONFIG
 # -------------------------
 DATASET_PATH = None
+EXTERNAL_VALIDATION_BUNDLE_PATH = None  # ===== MODIFIED SECTION (PATCH 2): runtime-configurable standards/HIL evidence bundle =====
 MAKE_PLOTS = True
 SAVE_MODEL_BUNDLE = True
 
@@ -1676,9 +1677,12 @@ def run_hybrid_ml_controller(
         "candidate_confidences": [1.0 - local_escalation_score],
         "candidate_valid_probs": [1.0],
         "candidate_disagreement": 0.0,
-        "candidate_scores_are_model_predicted": True,
-        "candidate_generation_mode": "learned_multi_candidate",
-        "candidate_score_mode": "model_predicted",
+        "candidate_scores_are_model_predicted": False,
+        "candidate_generation_mode": "local_placeholder_not_model_candidate",
+        "candidate_score_mode": "local_placeholder_not_model_score",
+        "local_route_placeholder_candidates": True,
+        "candidate_fields_are_learned": False,
+        "controller_mode": "LOCAL_TRACK",
         "emergency_candidate_backup_used": False,
         "local_escalation_trigger_mode": local_escalation_trigger_mode,
         "local_shade_trigger_mode": local_escalation_trigger_mode,
@@ -1713,6 +1717,9 @@ def run_hybrid_ml_controller(
             calib=calib,
             cfg=cfg,
         )
+        pred["local_route_placeholder_candidates"] = False
+        pred["candidate_fields_are_learned"] = True
+        pred["controller_mode"] = "SHADE_GMPPT"
         low_confidence = int(pred["sigma"] >= calib["sigma_threshold"])
         cand_scores = np.array(pred["candidate_scores"], dtype=float)
         mean_cand_score = float(np.mean(cand_scores)) if len(cand_scores) else 0.0
@@ -1770,6 +1777,7 @@ def run_hybrid_ml_controller(
     ratio = pbest / (oracle.pmpp_true + 1e-9)
     return {
         "mode": mode,
+        "controller_mode": mode,
         "final_V_best": vbest,
         "final_P_best": pbest,
         "ratio": ratio,
@@ -1816,6 +1824,10 @@ def run_hybrid_ml_controller(
         "candidate_confidences_pred": list(pred.get("candidate_confidences", pred.get("candidate_scores", []))),
         "candidate_valid_probs_pred": list(pred.get("candidate_valid_probs", [])),
         "candidate_generation_mode_used": str(pred.get("candidate_generation_mode", "learned_multi_candidate")),
+        "candidate_score_mode_used": str(pred.get("candidate_score_mode", "model_predicted")),
+        "candidate_scores_are_model_predicted": bool(pred.get("candidate_scores_are_model_predicted", False)),
+        "local_route_placeholder_candidates": int(bool(pred.get("local_route_placeholder_candidates", mode == "LOCAL_TRACK"))),
+        "candidate_fields_are_learned": int(bool(pred.get("candidate_fields_are_learned", mode == "SHADE_GMPPT"))),
         "emergency_candidate_backup_used": int(bool(pred.get("emergency_candidate_backup_used", False))),
         "norm_vhat_coarse_gap": float(abs((pred["vhat"] * oracle.voc) - coarse_best_v) / max(oracle.voc, 1e-9)) if enter_shade_mode else 0.0,
     }
@@ -2411,7 +2423,12 @@ _y_true_local_cnn, _y_score_local_cnn, _center_norm_local_cnn, local_metrics_cnn
     micro_detector=cnn_cal.get("micro_detector", None) if cfg.use_micro_ml_detector else None,
 )
 local_center_band_metrics_mlp = local_detector_metrics_by_center_band(y_true_local, y_score_local, center_norm_local, local_eval_threshold_mlp)
-local_center_band_metrics_cnn = local_detector_metrics_by_center_band(y_true_local, y_score_local, center_norm_local, local_eval_threshold_cnn)
+local_center_band_metrics_cnn = local_detector_metrics_by_center_band(
+    _y_true_local_cnn,
+    _y_score_local_cnn,
+    _center_norm_local_cnn,
+    local_eval_threshold_cnn,
+)
 shade_detection_modes = {
     "coarse_scan_detector_mode": "ml_classifier",
     "local_track_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
@@ -2487,7 +2504,13 @@ df_cnn_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=cnn, stdz=std
 
 def build_drift_baseline(df_ctrl: pd.DataFrame):
     feature_cols = ["local_escalation_score", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score"]
-    baseline_mean_candidate = float(df_ctrl["mean_candidate_score"].mean()) if "mean_candidate_score" in df_ctrl else np.nan
+    learned_mask = (df_ctrl["candidate_fields_are_learned"] == 1) if "candidate_fields_are_learned" in df_ctrl else pd.Series(False, index=df_ctrl.index)
+    learned_df = df_ctrl[learned_mask].copy()
+    baseline_mean_candidate = float(learned_df["mean_candidate_score"].mean()) if ("mean_candidate_score" in learned_df and len(learned_df) > 0) else np.nan
+    candidate_feature_means = {c: float(learned_df[c].mean()) for c in ["candidate_disagreement", "mean_candidate_score"] if c in learned_df and len(learned_df) > 0}
+    candidate_feature_stds = {c: float(max(learned_df[c].std(ddof=0), 1e-6)) for c in ["candidate_disagreement", "mean_candidate_score"] if c in learned_df and len(learned_df) > 0}
+    non_candidate_feature_means = {c: float(df_ctrl[c].mean()) for c in ["local_escalation_score", "sigma_vhat", "norm_vhat_coarse_gap"] if c in df_ctrl}
+    non_candidate_feature_stds = {c: float(max(df_ctrl[c].std(ddof=0), 1e-6)) for c in ["local_escalation_score", "sigma_vhat", "norm_vhat_coarse_gap"] if c in df_ctrl}
     return {
         "rate_means": {
             "avg_sigma": float(df_ctrl["sigma_vhat"].mean()),
@@ -2496,16 +2519,20 @@ def build_drift_baseline(df_ctrl: pd.DataFrame):
             "shade_rate": float(df_ctrl["shade_flag"].mean()),
             "coarse_multipeak_rate": float(df_ctrl["coarse_multipeak"].mean()),
         },
-        "feature_means": {c: float(df_ctrl[c].mean()) for c in feature_cols if c in df_ctrl},
-        "feature_stds": {c: float(max(df_ctrl[c].std(ddof=0), 1e-6)) for c in feature_cols if c in df_ctrl},
+        "feature_means": {**non_candidate_feature_means, **candidate_feature_means},
+        "feature_stds": {**non_candidate_feature_stds, **candidate_feature_stds},
         "fallback_reason_hist": df_ctrl["fallback_reason"].value_counts(normalize=True).to_dict(),
         "mean_candidate_score_baseline": baseline_mean_candidate,
         "mean_candidate_confidence_baseline_deprecated_alias": baseline_mean_candidate,
-        "candidate_disagreement_baseline": float(df_ctrl["candidate_disagreement"].mean()) if "candidate_disagreement" in df_ctrl else np.nan,
+        "candidate_disagreement_baseline": float(learned_df["candidate_disagreement"].mean()) if ("candidate_disagreement" in learned_df and len(learned_df) > 0) else np.nan,
         "local_escalation_score_baseline": float(df_ctrl["local_escalation_score"].mean()) if "local_escalation_score" in df_ctrl else np.nan,
         "local_shade_score_baseline": float(df_ctrl["local_escalation_score"].mean()) if "local_escalation_score" in df_ctrl else np.nan,
         "sigma_vhat_baseline": float(df_ctrl["sigma_vhat"].mean()) if "sigma_vhat" in df_ctrl else np.nan,
         "fallback_reason_hist_baseline": df_ctrl["fallback_reason"].value_counts(normalize=True).to_dict(),
+        "candidate_drift_scope": "candidate_features_use_learned_rows_only",
+        "candidate_drift_rows": int(len(learned_df)),
+        "candidate_drift_rows_total": int(len(df_ctrl)),
+        "controller_mode_distribution": df_ctrl["controller_mode"].value_counts(normalize=True).to_dict() if "controller_mode" in df_ctrl else {},
     }
 
 drift_baseline_mlp = build_drift_baseline(df_mlp_cal)
@@ -2518,7 +2545,15 @@ for _, rr in df_cnn.iterrows():
     mon_cnn.update(rr.to_dict())
 drift_summary_mlp = mon_mlp.summarize()
 drift_summary_cnn = mon_cnn.summarize()
-drift_summary = {"mlp": drift_summary_mlp, "cnn": drift_summary_cnn}
+drift_summary = {
+    "mlp": drift_summary_mlp,
+    "cnn": drift_summary_cnn,
+    "candidate_drift_scope": "candidate_features_use_rows_where_candidate_fields_are_learned==True",
+    "mode_split_episode_counts": {
+        "mlp": df_mlp["controller_mode"].value_counts().to_dict() if "controller_mode" in df_mlp else {},
+        "cnn": df_cnn["controller_mode"].value_counts().to_dict() if "controller_mode" in df_cnn else {},
+    },
+}
 print("\n=== 11) drift monitor summary ===")
 print(drift_summary)
 
@@ -2817,7 +2852,12 @@ dynamic_pref = dynamic_transition_proxy_report_mlp if preferred_model == "hybrid
 dynamic_proxy_scores = [float(v.get("average_power_ratio", np.nan)) for v in dynamic_pref.values()] if isinstance(dynamic_pref, dict) else []
 dynamic_proxy_eff = float(np.nanmean(dynamic_proxy_scores)) if len(dynamic_proxy_scores) else np.nan
 static_proxy_eff = float(final_recommendation.get("static_efficiency_proxy", np.nan))
-external_validation_bundle = load_external_validation_bundle(None)
+external_validation_bundle = load_external_validation_bundle(EXTERNAL_VALIDATION_BUNDLE_PATH)
+print("\n=== G2) external validation bundle source ===")
+print({
+    "external_validation_bundle_loaded": bool(external_validation_bundle.get("loaded", False)),
+    "external_validation_bundle_source": external_validation_bundle.get("source", None),
+})
 has_true_standard_static = bool(external_validation_bundle.get("has_true_standard_static", False))
 has_true_standard_dynamic = bool(external_validation_bundle.get("has_true_standard_dynamic", False))
 static_efficiency_gate = bool(static_proxy_eff >= cfg.static_efficiency_threshold) if has_true_standard_static else "proxy_only"
@@ -2849,9 +2889,15 @@ final_recommendation["hil_validated"] = hil_validated
 final_recommendation["has_true_standard_static"] = bool(has_true_standard_static)
 final_recommendation["has_true_standard_dynamic"] = bool(has_true_standard_dynamic)
 final_recommendation["frozen_firmware_release_evidence"] = bool(frozen_firmware_release_evidence)
+final_recommendation["external_validation_bundle_loaded"] = bool(external_validation_bundle.get("loaded", False))
+final_recommendation["external_validation_bundle_source"] = external_validation_bundle.get("source", None)
 final_recommendation["pilot_ready"] = bool(pilot_ready)
 final_recommendation["industry_ready"] = industry_ready
 final_recommendation["deployable"] = deployable
+final_recommendation["architecture_summary_text"] = (
+    "Learned candidate heads are used in SHADE_GMPPT mode. LOCAL_TRACK mode uses local escalation logic "
+    "with placeholder candidate fields for audit continuity only. Deterministic fallback remains final authority."
+)
 final_recommendation["strict_gate_status"] = {
     "shaded_gain_vs_baseline_gt_zero": bool(final_recommendation["shaded_gain_vs_baseline"] > 0.0),
     "nonshaded_no_harm_gate": bool(final_recommendation["nonshaded_delta_vs_baseline"] >= -cfg.nonshaded_no_harm_tolerance),
@@ -2882,10 +2928,11 @@ print(final_recommendation)
 architecture_status = {
     "coarse_scan_ml_detector": True,
     "local_track_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
-    "local_track_quick_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
-    "candidate_generation_mode": "learned_multi_candidate",
-    "candidate_score_mode": "model_predicted",
+    "local_track_quick_detector_mode": "micro_ml",
+    "candidate_generation_mode": "learned_multi_candidate_in_shade_gmppt_mode",
+    "candidate_score_mode": "model_predicted_in_shade_gmppt_mode",
     "candidate_scores_are_model_predicted": True,
+    "local_track_candidate_placeholders": True,
     "deterministic_fallback_final_authority": True,
 }
 standards_validation_status = {
@@ -2916,12 +2963,19 @@ print({
 })
 print("\n=== I) controller audit modes ===")
 print({
-    "candidate_mode": "learned_multi_candidate",
-    "candidate_confidence_mode": "model_predicted",
+    "candidate_mode": "learned_multi_candidate_in_shade_gmppt_mode",
+    "candidate_confidence_mode": "model_predicted_in_shade_gmppt_mode",
+    "local_track_candidate_mode": "local_placeholder_not_model_candidate",
+    "local_track_candidate_confidence_mode": "local_placeholder_not_model_score",
     "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "shade_detection_modes": shade_detection_modes,
 })
+print("\n=== I2) architecture summary text ===")
+print(
+    "Learned candidate heads run in SHADE_GMPPT mode; LOCAL_TRACK uses local escalation logic and placeholder "
+    "candidate fields only for audit continuity; deterministic fallback remains final authority."
+)
 print("\n=== J) standards/HIL evidence flags ===")
 print({
     "has_true_standard_static": bool(has_true_standard_static),
@@ -3017,9 +3071,12 @@ if SAVE_MODEL_BUNDLE:
             "candidate_secondary_power_floor_ratio": float(cfg.candidate_secondary_power_floor_ratio),
         },
         "candidate_head_config": {
-            "candidate_generation_mode": "learned_multi_candidate",
-            "candidate_score_mode": "model_predicted",
+            "candidate_generation_mode": "learned_multi_candidate_in_shade_gmppt_mode",
+            "candidate_score_mode": "model_predicted_in_shade_gmppt_mode",
             "candidate_scores_are_model_predicted": True,
+            "local_track_candidate_placeholders": True,
+            "local_track_candidate_generation_mode": "local_placeholder_not_model_candidate",
+            "local_track_candidate_score_mode": "local_placeholder_not_model_score",
             "lambda_cand_v": float(cfg.lambda_cand_v),
             "lambda_cand_rank": float(cfg.lambda_cand_rank),
             "lambda_cand_valid": float(cfg.lambda_cand_valid),
@@ -3032,8 +3089,10 @@ if SAVE_MODEL_BUNDLE:
         },
         "split_metadata": split_info,
         "test_set_mode": test_set_mode,
-        "candidate_mode": "learned_multi_candidate",
-        "candidate_confidence_mode": "model_predicted",
+        "candidate_mode": "learned_multi_candidate_in_shade_gmppt_mode",
+        "candidate_confidence_mode": "model_predicted_in_shade_gmppt_mode",
+        "local_track_candidate_mode": "local_placeholder_not_model_candidate",
+        "local_track_candidate_confidence_mode": "local_placeholder_not_model_score",
         "local_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
         "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
         "shade_detection_modes": shade_detection_modes,
@@ -3064,6 +3123,8 @@ if SAVE_MODEL_BUNDLE:
         "hil_validated": bool(hil_validated),
         "frozen_firmware_release_evidence": bool(frozen_firmware_release_evidence),
         "external_validation_bundle": external_validation_bundle,
+        "external_validation_bundle_loaded": bool(external_validation_bundle.get("loaded", False)),
+        "external_validation_bundle_source": external_validation_bundle.get("source", None),
         "architecture_status": architecture_status,
         "standards_validation_status": standards_validation_status,
         "hil_validation_status": hil_validation_status,
