@@ -87,6 +87,8 @@ class Config:
     dynamic_efficiency_threshold: float = 0.99
     research_only_mode: bool = False
     use_micro_ml_detector: bool = False
+    local_trigger_center_grid: Tuple[float, ...] = (0.55, 0.65, 0.75, 0.85)
+    local_trigger_rollout_steps: int = 2
 
     # evaluation
     evaluate_all_test_curves: bool = True
@@ -113,6 +115,7 @@ class Config:
 
 
 cfg = Config()
+cfg.use_micro_ml_detector = False  # ===== MODIFIED SECTION (PATCH 2): Option B frozen deterministic LOCAL_TRACK detector =====
 
 
 # -------------------------
@@ -513,7 +516,7 @@ class DriftMonitor:
                 exceeded.append(k)
         feature_z = {}
         strong_feature = []
-        for col in ["shade_prob", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score", "mean_candidate_confidence"]:
+        for col in ["local_shade_score", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score"]:
             if col in df and col in self.baseline.get("feature_means", {}):
                 mu0 = self.baseline["feature_means"][col]
                 sd0 = max(self.baseline["feature_stds"].get(col, 1e-6), 1e-6)
@@ -801,14 +804,17 @@ def calibrate_shade_threshold(model, arrays_cal, cfg: Config) -> Dict[str, float
 
 
 def calibrate_local_shade_trigger_threshold(rows_cal: List[Dict], cfg: Config) -> Dict[str, float]:
-    """PATCH 1: calibrate deterministic LOCAL_TRACK shade trigger threshold separately from ML shade head."""
+    """PATCH 1: calibrate deterministic LOCAL_TRACK trigger with runtime-faithful center sampling."""
     y_true = []
     y_score = []
     for r in rows_cal:
         oracle = CurveOracle(r["v_curve"], r["i_curve"])
-        center_v = float(np.clip(0.72 * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+        centers = sample_local_track_centers(oracle, cfg)
+        if len(centers) == 0:
+            continue
+        scores = [float(microscan_shade_heuristic_score(oracle, cv, cfg)) for cv in centers]
         y_true.append(int(r["y_shade"]))
-        y_score.append(float(microscan_shade_heuristic_score(oracle, center_v, cfg)))
+        y_score.append(float(np.mean(scores)))
 
     if len(y_score) == 0:
         return {
@@ -817,6 +823,9 @@ def calibrate_local_shade_trigger_threshold(rows_cal: List[Dict], cfg: Config) -
             "local_shade_recall": 0.0,
             "local_shade_f1": 0.0,
             "local_shade_bal_acc": 0.0,
+            "local_trigger_calibration_mode": "runtime_center_sweep",
+            "local_trigger_center_grid": [float(x) for x in cfg.local_trigger_center_grid],
+            "local_trigger_center_count": 0,
         }
 
     y_true = np.asarray(y_true, dtype=int)
@@ -846,6 +855,9 @@ def calibrate_local_shade_trigger_threshold(rows_cal: List[Dict], cfg: Config) -
         "local_shade_recall": best["recall"],
         "local_shade_f1": best["f1"],
         "local_shade_bal_acc": best["bal_acc"],
+        "local_trigger_calibration_mode": "runtime_center_sweep",
+        "local_trigger_center_grid": [float(x) for x in cfg.local_trigger_center_grid],
+        "local_trigger_center_count": int(len(cfg.local_trigger_center_grid) + max(int(cfg.local_trigger_rollout_steps), 0)),
     }
 
 
@@ -1039,6 +1051,27 @@ def microscan_shade_heuristic_score(
     return float(np.clip(score, 0.0, 1.0))
 
 
+# ===== MODIFIED SECTION (PATCH 1): LOCAL_TRACK runtime-faithful center sampling =====
+def sample_local_track_centers(oracle: CurveOracle, cfg: Config) -> List[float]:
+    """Sample LOCAL_TRACK centers that better match runtime operating-point behavior."""
+    if oracle.voc <= 0:
+        return []
+    cmin = cfg.sample_fracs_min * oracle.voc
+    cmax = cfg.sample_fracs_max * oracle.voc
+    centers = []
+    for frac in cfg.local_trigger_center_grid:
+        centers.append(float(np.clip(float(frac) * oracle.voc, cmin, cmax)))
+
+    # Short deterministic rollout to mimic local tracking center distribution.
+    rollout_v = float(np.clip(0.72 * oracle.voc, cmin, cmax))
+    for _ in range(max(int(cfg.local_trigger_rollout_steps), 0)):
+        rollout_v, _rollout_p, _ = refine_local(oracle, rollout_v, cfg)
+        centers.append(float(np.clip(rollout_v, cmin, cmax)))
+
+    centers_unique = sorted(set(round(c, 9) for c in centers))
+    return [float(c) for c in centers_unique]
+
+
 def build_micro_scan_features(oracle: CurveOracle, center_v: float, cfg: Config) -> Dict[str, float]:
     """PATCH 4: placeholder micro-scan feature interface for future dedicated local ML detector."""
     vm = float(np.clip(center_v, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
@@ -1117,6 +1150,12 @@ def run_hybrid_ml_controller(
     runtime_state: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     runtime_state = runtime_state if runtime_state is not None else {}
+    # ===== MODIFIED SECTION (PATCH 2): freeze deterministic local quick-detector path in this notebook =====
+    if cfg.use_micro_ml_detector:
+        raise RuntimeError(
+            "use_micro_ml_detector=True is not supported in this notebook release. "
+            "LOCAL_TRACK quick-shade trigger is frozen to deterministic heuristic."
+        )
     v_curr = float(runtime_state.get("v_operating", 0.72 * oracle.voc))
     v_curr = float(np.clip(v_curr, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
 
@@ -1128,12 +1167,7 @@ def run_hybrid_ml_controller(
     p_right = float(local_right * oracle.measure(local_right))
     local_spread = abs(p_right - p_left) / max(local_p, 1e-9)
     local_shade_trigger_mode = "deterministic_heuristic"
-    if cfg.use_micro_ml_detector:
-        local_shade_trigger_mode = "micro_ml_detector"
-        micro_features = build_micro_scan_features(oracle, local_v, cfg)
-        local_shade_score = float(micro_ml_predict(calib.get("micro_shade_detector", None), micro_features, cfg))
-    else:
-        local_shade_score = microscan_shade_heuristic_score(oracle, local_v, cfg)
+    local_shade_score = microscan_shade_heuristic_score(oracle, local_v, cfg)
 
     prev_p = float(runtime_state.get("last_power", local_p))
     anomaly_trigger = int(local_p < cfg.anomaly_drop_ratio * max(prev_p, 1e-9))
@@ -1148,14 +1182,12 @@ def run_hybrid_ml_controller(
     vbest, pbest = ref_v, ref_p
     pred = {
         "vhat": local_v / max(oracle.voc, 1e-9),
-        "confidence": 1.0 - 0.5 * local_shade_score,  # backward-compatible alias (LOCAL_TRACK heuristic score)
+        "confidence": np.nan,
         "sigma": 0.0,
         "raw_sigma": 0.0,
         "shade_flag": shade_trigger_local,
-        "shade_prob": local_shade_score,  # backward-compatible alias to local_shade_score
         "local_shade_score": local_shade_score,
         "V_candidates": [local_v / max(oracle.voc, 1e-9)],
-        "candidate_confidences": [1.0 - local_shade_score],  # backward-compatible alias to candidate_scores
         "candidate_scores": [1.0 - local_shade_score],
         "candidate_disagreement": 0.0,
         "candidate_scores_are_model_predicted": False,
@@ -1191,7 +1223,7 @@ def run_hybrid_ml_controller(
             cfg=cfg,
         )
         low_confidence = int(pred["sigma"] >= calib["sigma_threshold"])
-        cand_scores = np.array(pred.get("candidate_scores", pred["candidate_confidences"]), dtype=float)
+        cand_scores = np.array(pred["candidate_scores"], dtype=float)
         mean_cand_score = float(np.mean(cand_scores)) if len(cand_scores) else 0.0
         min_cand_score = float(np.min(cand_scores)) if len(cand_scores) else 0.0
         max_cand_score = float(np.max(cand_scores)) if len(cand_scores) else 0.0
@@ -1244,9 +1276,9 @@ def run_hybrid_ml_controller(
         if fallback == 0 and pred["confidence"] < cfg.low_conf_widen_threshold and fallback_reason == "none":
             fallback, fallback_reason = 1, "low_global_confidence"
     else:
-        mean_cand_score = float(np.mean(pred.get("candidate_scores", pred["candidate_confidences"])))
-        min_cand_score = float(np.min(pred.get("candidate_scores", pred["candidate_confidences"])))
-        max_cand_score = float(np.max(pred.get("candidate_scores", pred["candidate_confidences"])))
+        mean_cand_score = float(np.mean(pred["candidate_scores"]))
+        min_cand_score = float(np.min(pred["candidate_scores"]))
+        max_cand_score = float(np.max(pred["candidate_scores"]))
 
     if fallback:
         vscan = np.linspace(0.10 * oracle.voc, 0.95 * oracle.voc, cfg.widen_scan_steps)
@@ -1270,8 +1302,9 @@ def run_hybrid_ml_controller(
         "sigma_vhat": pred["sigma"],
         "raw_sigma_vhat": pred["raw_sigma"],
         "shade_flag": int(pred["shade_flag"]),
-        "shade_prob": float(pred["shade_prob"]),  # backward-compatible alias to local_shade_score in LOCAL_TRACK
+        "shade_prob_deprecated_alias": float(pred.get("shade_prob", np.nan)),
         "local_shade_score": float(local_shade_score),
+        "local_shade_triggered": int(shade_trigger_local),
         "local_shade_trigger_threshold": float(local_shade_trigger_threshold),
         "local_shade_trigger_mode": local_shade_trigger_mode,
         "coarse_multipeak": coarse_multipeak,
@@ -1290,9 +1323,9 @@ def run_hybrid_ml_controller(
         "mean_candidate_score": float(mean_cand_score),
         "candidate_score_min": float(min_cand_score),
         "candidate_score_max": float(max_cand_score),
-        "mean_candidate_confidence": float(mean_cand_score),  # backward-compatible alias to mean_candidate_score
-        "candidate_confidence_min": float(min_cand_score),  # backward-compatible alias to candidate_score_min
-        "candidate_confidence_max": float(max_cand_score),  # backward-compatible alias to candidate_score_max
+        "mean_candidate_confidence_deprecated_alias": float(mean_cand_score),
+        "candidate_confidence_min_deprecated_alias": float(min_cand_score),
+        "candidate_confidence_max_deprecated_alias": float(max_cand_score),
         "used_ml_candidates": int(enter_shade_mode and (fallback == 0)),
         "used_fallback_scan": int(fallback),
         "candidate_disagreement": float(pred.get("candidate_disagreement", 0.0)),
@@ -1369,9 +1402,7 @@ def rows_to_arrays(rows: List[Dict]):
 def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
     mode_sha = float((df["mode"] == "SHADE_GMPPT").mean()) if "mode" in df else np.nan
     cand_accept = float(df["candidate_accept"].mean()) if "candidate_accept" in df else np.nan
-    mean_cand_score = float(df["mean_candidate_score"].mean()) if "mean_candidate_score" in df else (
-        float(df["mean_candidate_confidence"].mean()) if "mean_candidate_confidence" in df else np.nan
-    )
+    mean_cand_score = float(df["mean_candidate_score"].mean()) if "mean_candidate_score" in df else np.nan
     return {
         "average_tracking_efficiency": float(df["efficiency"].mean()),
         "average_power_ratio": float(df["ratio"].mean()),
@@ -1386,7 +1417,7 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
         "shade_gmppt_mode_rate": mode_sha,
         "candidate_accept_rate": cand_accept,
         "mean_candidate_score": mean_cand_score,
-        "mean_candidate_confidence": mean_cand_score,  # backward-compatible alias
+        "mean_candidate_confidence_deprecated_alias": mean_cand_score,
         "used_ml_candidates_rate": float(df["used_ml_candidates"].mean()) if "used_ml_candidates" in df else np.nan,
         "used_fallback_scan_rate": float(df["used_fallback_scan"].mean()) if "used_fallback_scan" in df else np.nan,
     }
@@ -1498,6 +1529,54 @@ def profile_model_compute(model, sample_flat, sample_scalar, sample_seq, cfg: Co
         "max_inference_time_sec_per_sample": max_sample,
         "meets_pdf_latency_target": bool(max_sample <= cfg.preferred_compute_latency_threshold_sec),
         "meets_relaxed_research_latency_target": bool(max_sample <= cfg.relaxed_compute_latency_threshold_sec),
+    }
+
+
+# ===== MODIFIED SECTION (PATCH 5): external evidence ingestion stub =====
+def load_external_validation_bundle(bundle_path: Optional[str] = None) -> Dict[str, object]:
+    """
+    Stub for future IEC/EN/HIL evidence ingestion.
+    Expected keys:
+      - has_true_standard_static
+      - has_true_standard_dynamic
+      - hil_validated
+      - frozen_firmware_release_evidence
+    """
+    if bundle_path is None or not os.path.exists(bundle_path):
+        return {
+            "loaded": False,
+            "source": bundle_path,
+            "has_true_standard_static": False,
+            "has_true_standard_dynamic": False,
+            "hil_validated": False,
+            "frozen_firmware_release_evidence": False,
+            "notes": "No external validation bundle supplied.",
+        }
+    try:
+        if bundle_path.lower().endswith(".pt"):
+            data = torch.load(bundle_path, map_location="cpu")
+        elif bundle_path.lower().endswith(".npz"):
+            data = dict(np.load(bundle_path, allow_pickle=True))
+        else:
+            data = {}
+    except Exception as e:
+        return {
+            "loaded": False,
+            "source": bundle_path,
+            "has_true_standard_static": False,
+            "has_true_standard_dynamic": False,
+            "hil_validated": False,
+            "frozen_firmware_release_evidence": False,
+            "notes": f"Failed to parse bundle: {e}",
+        }
+    return {
+        "loaded": True,
+        "source": bundle_path,
+        "has_true_standard_static": bool(data.get("has_true_standard_static", False)),
+        "has_true_standard_dynamic": bool(data.get("has_true_standard_dynamic", False)),
+        "hil_validated": bool(data.get("hil_validated", False)),
+        "frozen_firmware_release_evidence": bool(data.get("frozen_firmware_release_evidence", False)),
+        "notes": data.get("notes", "loaded"),
     }
 
 
@@ -1667,26 +1746,55 @@ def evaluate_coarse_shade_head(model, arrays, cfg: Config):
 def evaluate_local_heuristic_shade(rows: List[Dict], cfg: Config, threshold: float):
     y_true = []
     y_score = []
+    center_norm = []
     for r in rows:
         oracle = CurveOracle(r["v_curve"], r["i_curve"])
-        # deterministic operating-point proxy in LOCAL_TRACK mode
-        center_v = float(np.clip(0.72 * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+        centers = sample_local_track_centers(oracle, cfg)
+        if len(centers) == 0:
+            continue
         y_true.append(int(r["y_shade"]))
-        y_score.append(float(microscan_shade_heuristic_score(oracle, center_v, cfg)))
+        y_score.append(float(np.mean([microscan_shade_heuristic_score(oracle, c, cfg) for c in centers])))
+        center_norm.append(float(np.mean([c / max(oracle.voc, 1e-9) for c in centers])))
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
-    return y_true, y_score, compute_binary_metrics(y_true, y_score, threshold)
+    center_norm = np.asarray(center_norm, dtype=float)
+    metrics = compute_binary_metrics(y_true, y_score, threshold)
+    return y_true, y_score, center_norm, metrics
+
+
+def local_detector_metrics_by_center_band(y_true: np.ndarray, y_score: np.ndarray, center_norm: np.ndarray, threshold: float):
+    # ===== MODIFIED SECTION (PATCH 6): local detector stability across operating regions =====
+    bands = [(0.55, 0.65), (0.65, 0.75), (0.75, 0.85)]
+    out = {}
+    for lo, hi in bands:
+        mask = (center_norm >= lo) & (center_norm < hi)
+        key = f"{lo:.2f}-{hi:.2f}_voc"
+        if int(np.sum(mask)) == 0:
+            out[key] = {"n": 0, "note": "no samples in band"}
+            continue
+        m = compute_binary_metrics(y_true[mask], y_score[mask], threshold)
+        out[key] = {
+            "n": int(np.sum(mask)),
+            "precision": float(m["precision"]),
+            "recall": float(m["recall"]),
+            "f1": float(m["f1"]),
+            "balanced_accuracy": float(m["balanced_accuracy"]),
+            "false_trigger_rate_non_shaded": float(m["false_trigger_rate_non_shaded"]),
+        }
+    return out
 
 
 y_true_mlp, y_score_mlp = evaluate_coarse_shade_head(mlp, exp_test_arrays, cfg)
 y_true_cnn, y_score_cnn = evaluate_coarse_shade_head(cnn, exp_test_arrays, cfg)
 local_trigger_threshold_mlp = float(mlp_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))
 local_trigger_threshold_cnn = float(cnn_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))
-y_true_local, y_score_local, local_metrics_mlp = evaluate_local_heuristic_shade(exp_test_rows, cfg, local_trigger_threshold_mlp)
-_y_true_local_cnn, _y_score_local_cnn, local_metrics_cnn = evaluate_local_heuristic_shade(exp_test_rows, cfg, local_trigger_threshold_cnn)
+y_true_local, y_score_local, center_norm_local, local_metrics_mlp = evaluate_local_heuristic_shade(exp_test_rows, cfg, local_trigger_threshold_mlp)
+_y_true_local_cnn, _y_score_local_cnn, _center_norm_local_cnn, local_metrics_cnn = evaluate_local_heuristic_shade(exp_test_rows, cfg, local_trigger_threshold_cnn)
+local_center_band_metrics_mlp = local_detector_metrics_by_center_band(y_true_local, y_score_local, center_norm_local, local_trigger_threshold_mlp)
+local_center_band_metrics_cnn = local_detector_metrics_by_center_band(y_true_local, y_score_local, center_norm_local, local_trigger_threshold_cnn)
 shade_detection_modes = {
     "coarse_scan_detector_mode": "ml_classifier",
-    "local_track_detector_mode": "deterministic_heuristic" if not cfg.use_micro_ml_detector else "micro_ml_detector",
+    "local_track_detector_mode": "deterministic_heuristic",
     "coarse_scan_detector_thresholds": {
         "mlp": float(mlp_cal["shade_threshold"]),
         "cnn": float(cnn_cal["shade_threshold"]),
@@ -1695,6 +1803,9 @@ shade_detection_modes = {
         "mlp": local_trigger_threshold_mlp,
         "cnn": local_trigger_threshold_cnn,
     },
+    "local_trigger_calibration_mode": "runtime_center_sweep",
+    "local_trigger_center_grid": [float(x) for x in cfg.local_trigger_center_grid],
+    "local_trigger_center_count": int(len(cfg.local_trigger_center_grid) + max(int(cfg.local_trigger_rollout_steps), 0)),
 }
 shade_detector_report = {
     "modes": shade_detection_modes,
@@ -1706,6 +1817,10 @@ shade_detector_report = {
         "mode": shade_detection_modes["local_track_detector_mode"],
         "mlp_route_metrics": local_metrics_mlp,
         "cnn_route_metrics": local_metrics_cnn,
+        "metrics_by_center_region": {
+            "mlp": local_center_band_metrics_mlp,
+            "cnn": local_center_band_metrics_cnn,
+        },
     },
 }
 print("\n=== 9B) shade detector report ===")
@@ -1734,10 +1849,8 @@ df_mlp_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=mlp, stdz=std
 df_cnn_cal, _ = evaluate_controller(exp_cal_rows, mode="ml", model=cnn, stdz=stdz, calib=cnn_cal, cfg=cfg)
 
 def build_drift_baseline(df_ctrl: pd.DataFrame):
-    feature_cols = ["shade_prob", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score", "mean_candidate_confidence"]
-    baseline_mean_candidate = float(df_ctrl["mean_candidate_score"].mean()) if "mean_candidate_score" in df_ctrl else (
-        float(df_ctrl["mean_candidate_confidence"].mean()) if "mean_candidate_confidence" in df_ctrl else np.nan
-    )
+    feature_cols = ["local_shade_score", "sigma_vhat", "norm_vhat_coarse_gap", "candidate_disagreement", "mean_candidate_score"]
+    baseline_mean_candidate = float(df_ctrl["mean_candidate_score"].mean()) if "mean_candidate_score" in df_ctrl else np.nan
     return {
         "rate_means": {
             "avg_sigma": float(df_ctrl["sigma_vhat"].mean()),
@@ -1750,7 +1863,7 @@ def build_drift_baseline(df_ctrl: pd.DataFrame):
         "feature_stds": {c: float(max(df_ctrl[c].std(ddof=0), 1e-6)) for c in feature_cols if c in df_ctrl},
         "fallback_reason_hist": df_ctrl["fallback_reason"].value_counts(normalize=True).to_dict(),
         "mean_candidate_score_baseline": baseline_mean_candidate,
-        "mean_candidate_confidence_baseline": baseline_mean_candidate,
+        "mean_candidate_confidence_baseline_deprecated_alias": baseline_mean_candidate,
         "candidate_disagreement_baseline": float(df_ctrl["candidate_disagreement"].mean()) if "candidate_disagreement" in df_ctrl else np.nan,
         "sigma_vhat_baseline": float(df_ctrl["sigma_vhat"].mean()) if "sigma_vhat" in df_ctrl else np.nan,
         "fallback_reason_hist_baseline": df_ctrl["fallback_reason"].value_counts(normalize=True).to_dict(),
@@ -1870,7 +1983,7 @@ final_recommendation = {
     # PATCH 5: explicit audit labels for candidate/local detector modes.
     "candidate_mode": "deterministic_from_vhat_and_coarse_best",
     "candidate_confidence_mode": "deterministic_score_not_model_predicted",
-    "local_shade_detector_mode": "deterministic_heuristic" if not cfg.use_micro_ml_detector else "micro_ml_detector",
+    "local_shade_detector_mode": "deterministic_heuristic",
     "strict_gate_status": strict_gates,
     "research_recommended": bool(research_recommended),
     "pilot_ready": bool(pilot_ready),
@@ -1911,8 +2024,32 @@ print({
         "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
     },
     "local_shade_trigger_threshold_calibration": {
-        "mlp": {k: mlp_cal[k] for k in ["local_shade_trigger_threshold", "local_shade_precision", "local_shade_recall", "local_shade_f1", "local_shade_bal_acc"]},
-        "cnn": {k: cnn_cal[k] for k in ["local_shade_trigger_threshold", "local_shade_precision", "local_shade_recall", "local_shade_f1", "local_shade_bal_acc"]},
+        "mlp": {
+            k: mlp_cal[k]
+            for k in [
+                "local_shade_trigger_threshold",
+                "local_shade_precision",
+                "local_shade_recall",
+                "local_shade_f1",
+                "local_shade_bal_acc",
+                "local_trigger_calibration_mode",
+                "local_trigger_center_grid",
+                "local_trigger_center_count",
+            ]
+        },
+        "cnn": {
+            k: cnn_cal[k]
+            for k in [
+                "local_shade_trigger_threshold",
+                "local_shade_precision",
+                "local_shade_recall",
+                "local_shade_f1",
+                "local_shade_bal_acc",
+                "local_trigger_calibration_mode",
+                "local_trigger_center_grid",
+                "local_trigger_center_count",
+            ]
+        },
     },
 })
 print("\n=== B) test mode summary ===")
@@ -1994,12 +2131,13 @@ dynamic_pref = dynamic_transition_proxy_report_mlp if preferred_model == "hybrid
 dynamic_proxy_scores = [float(v.get("average_power_ratio", np.nan)) for v in dynamic_pref.values()] if isinstance(dynamic_pref, dict) else []
 dynamic_proxy_eff = float(np.nanmean(dynamic_proxy_scores)) if len(dynamic_proxy_scores) else np.nan
 static_proxy_eff = float(final_recommendation.get("static_efficiency_proxy", np.nan))
-has_true_standard_static = False
-has_true_standard_dynamic = bool(standards_dynamic_energy_report.get("validated", False))
+external_validation_bundle = load_external_validation_bundle(None)
+has_true_standard_static = bool(external_validation_bundle.get("has_true_standard_static", False))
+has_true_standard_dynamic = bool(external_validation_bundle.get("has_true_standard_dynamic", False))
 static_efficiency_gate = bool(static_proxy_eff >= cfg.static_efficiency_threshold) if has_true_standard_static else "proxy_only"
 dynamic_efficiency_gate = bool(dynamic_proxy_eff >= cfg.dynamic_efficiency_threshold) if has_true_standard_dynamic else "proxy_only"
-hil_validated = False
-frozen_firmware_release_evidence = False
+hil_validated = bool(external_validation_bundle.get("hil_validated", False))
+frozen_firmware_release_evidence = bool(external_validation_bundle.get("frozen_firmware_release_evidence", False))
 pilot_ready = bool(
     final_recommendation["research_recommended"]
     and final_recommendation["compute_feasible"] is True
@@ -2008,10 +2146,12 @@ pilot_ready = bool(
 )
 industry_ready = bool(
     pilot_ready is True
-    and static_efficiency_gate is True
-    and dynamic_efficiency_gate is True
+    and has_true_standard_static is True
+    and has_true_standard_dynamic is True
     and hil_validated is True
     and frozen_firmware_release_evidence is True
+    and static_efficiency_gate is True
+    and dynamic_efficiency_gate is True
 )
 deployable = bool(industry_ready if not cfg.research_only_mode else final_recommendation["research_recommended"])
 final_recommendation["dynamic_transition_proxy_efficiency"] = dynamic_proxy_eff
@@ -2033,6 +2173,8 @@ final_recommendation["strict_gate_status"] = {
     "drift_clear": bool(final_recommendation["drift_clear"]),
     "compute_feasible": bool(final_recommendation["compute_feasible"]),
     "pilot_ready": bool(pilot_ready),
+    "has_true_standard_static": bool(has_true_standard_static),
+    "has_true_standard_dynamic": bool(has_true_standard_dynamic),
     "static_efficiency_gate": static_efficiency_gate,
     "dynamic_efficiency_gate": dynamic_efficiency_gate,
     "hil_validated": bool(hil_validated),
@@ -2040,11 +2182,45 @@ final_recommendation["strict_gate_status"] = {
 }
 print("\n=== H) final recommendation (strict deployability gates) ===")
 print(final_recommendation)
+# ===== MODIFIED SECTION (PATCH 4): explicit final architecture status =====
+architecture_status = {
+    "coarse_scan_ml_detector": True,
+    "local_track_quick_detector_mode": "deterministic_heuristic",
+    "candidate_generation_mode": "deterministic_from_vhat_and_coarse_best",
+    "candidate_score_mode": "deterministic_score_not_model_predicted",
+    "deterministic_fallback_final_authority": True,
+}
+standards_validation_status = {
+    "has_true_standard_static": bool(has_true_standard_static),
+    "has_true_standard_dynamic": bool(has_true_standard_dynamic),
+    "static_efficiency_gate": static_efficiency_gate,
+    "dynamic_efficiency_gate": dynamic_efficiency_gate,
+}
+hil_validation_status = {
+    "hil_validated": bool(hil_validated),
+    "bundle_loaded": bool(external_validation_bundle.get("loaded", False)),
+}
+firmware_release_status = {
+    "frozen_firmware_release_evidence": bool(frozen_firmware_release_evidence),
+    "bundle_loaded": bool(external_validation_bundle.get("loaded", False)),
+}
+final_recommendation["architecture_status"] = architecture_status
+final_recommendation["standards_validation_status"] = standards_validation_status
+final_recommendation["hil_validation_status"] = hil_validation_status
+final_recommendation["firmware_release_status"] = firmware_release_status
+print("\n=== H2) architecture status ===")
+print(architecture_status)
+print("\n=== H3) standards / HIL / firmware status ===")
+print({
+    "standards_validation_status": standards_validation_status,
+    "hil_validation_status": hil_validation_status,
+    "firmware_release_status": firmware_release_status,
+})
 print("\n=== I) controller audit modes ===")
 print({
     "candidate_mode": "deterministic_from_vhat_and_coarse_best",
     "candidate_confidence_mode": "deterministic_score_not_model_predicted",
-    "local_shade_detector_mode": "deterministic_heuristic" if not cfg.use_micro_ml_detector else "micro_ml_detector",
+    "local_shade_detector_mode": "deterministic_heuristic",
     "shade_detection_modes": shade_detection_modes,
 })
 print("\n=== J) standards/HIL evidence flags ===")
@@ -2074,8 +2250,32 @@ if SAVE_MODEL_BUNDLE:
             "cnn": {k: cnn_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
         },
         "local_shade_trigger_threshold_calibration": {
-            "mlp": {k: mlp_cal[k] for k in ["local_shade_trigger_threshold", "local_shade_precision", "local_shade_recall", "local_shade_f1", "local_shade_bal_acc"]},
-            "cnn": {k: cnn_cal[k] for k in ["local_shade_trigger_threshold", "local_shade_precision", "local_shade_recall", "local_shade_f1", "local_shade_bal_acc"]},
+            "mlp": {
+                k: mlp_cal[k]
+                for k in [
+                    "local_shade_trigger_threshold",
+                    "local_shade_precision",
+                    "local_shade_recall",
+                    "local_shade_f1",
+                    "local_shade_bal_acc",
+                    "local_trigger_calibration_mode",
+                    "local_trigger_center_grid",
+                    "local_trigger_center_count",
+                ]
+            },
+            "cnn": {
+                k: cnn_cal[k]
+                for k in [
+                    "local_shade_trigger_threshold",
+                    "local_shade_precision",
+                    "local_shade_recall",
+                    "local_shade_f1",
+                    "local_shade_bal_acc",
+                    "local_trigger_calibration_mode",
+                    "local_trigger_center_grid",
+                    "local_trigger_center_count",
+                ]
+            },
         },
         "candidate_score_threshold_calibration": {
             "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
@@ -2085,7 +2285,7 @@ if SAVE_MODEL_BUNDLE:
         "test_set_mode": test_set_mode,
         "candidate_mode": "deterministic_from_vhat_and_coarse_best",
         "candidate_confidence_mode": "deterministic_score_not_model_predicted",
-        "local_shade_detector_mode": "deterministic_heuristic" if not cfg.use_micro_ml_detector else "micro_ml_detector",
+        "local_shade_detector_mode": "deterministic_heuristic",
         "shade_detection_modes": shade_detection_modes,
         "shade_detector_report": shade_detector_report,
         "drift_baselines": {"mlp": drift_baseline_mlp, "cnn": drift_baseline_cnn},
@@ -2112,6 +2312,11 @@ if SAVE_MODEL_BUNDLE:
         "has_true_standard_dynamic": bool(has_true_standard_dynamic),
         "hil_validated": bool(hil_validated),
         "frozen_firmware_release_evidence": bool(frozen_firmware_release_evidence),
+        "external_validation_bundle": external_validation_bundle,
+        "architecture_status": architecture_status,
+        "standards_validation_status": standards_validation_status,
+        "hil_validation_status": hil_validation_status,
+        "firmware_release_status": firmware_release_status,
         "compute_profiling_summary": compute_profile,
         "final_recommendation": final_recommendation,
     }
