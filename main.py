@@ -2928,7 +2928,7 @@ print(final_recommendation)
 architecture_status = {
     "coarse_scan_ml_detector": True,
     "local_track_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
-    "local_track_quick_detector_mode": "micro_ml",
+    "local_track_quick_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "candidate_generation_mode": "learned_multi_candidate_in_shade_gmppt_mode",
     "candidate_score_mode": "model_predicted_in_shade_gmppt_mode",
     "candidate_scores_are_model_predicted": True,
