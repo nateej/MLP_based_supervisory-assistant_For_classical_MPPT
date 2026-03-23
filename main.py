@@ -1276,6 +1276,51 @@ def compute_local_escalation_metrics(y_true: np.ndarray, y_score: np.ndarray, th
     return m
 
 
+def summarize_local_state_labels(states: List[Dict], split_name: str) -> Dict[str, float]:
+    y = np.asarray([int(st.get("y_escalate", 0)) for st in states], dtype=int)
+    n = int(len(y))
+    pos = int(np.sum(y == 1))
+    neg = int(np.sum(y == 0))
+    return {
+        "split": split_name,
+        "n_states": n,
+        "n_positive_escalation": pos,
+        "n_negative_escalation": neg,
+        "positive_rate": float(pos / max(n, 1)),
+    }
+
+
+def local_positive_rate_summaries(states: List[Dict], split_name: str) -> Dict[str, Dict]:
+    df = pd.DataFrame([{
+        "center_norm": float(st.get("center_norm", np.nan)),
+        "y_shade": int(st.get("y_shade", 0)),
+        "y_escalate": int(st.get("y_escalate", 0)),
+    } for st in states])
+    if len(df) == 0:
+        return {
+            "split": split_name,
+            "positive_rate_by_center_band": {},
+            "positive_rate_by_shaded_vs_nonshaded_curve": {},
+        }
+    df["center_band"] = pd.cut(
+        df["center_norm"],
+        bins=[0.0, 0.60, 0.70, 0.80, 1.01],
+        include_lowest=True,
+        labels=["0.00-0.60", "0.60-0.70", "0.70-0.80", "0.80-1.00"],
+    ).astype(str)
+    center_rates = df.groupby("center_band")["y_escalate"].mean().to_dict()
+    shade_rates = df.groupby("y_shade")["y_escalate"].mean().to_dict()
+    shade_rates_named = {
+        ("nonshaded_curve" if int(k) == 0 else "shaded_curve"): float(v)
+        for k, v in shade_rates.items()
+    }
+    return {
+        "split": split_name,
+        "positive_rate_by_center_band": {str(k): float(v) for k, v in center_rates.items()},
+        "positive_rate_by_shaded_vs_nonshaded_curve": shade_rates_named,
+    }
+
+
 def uncertainty_diagnostics(model, arrays, calib, cfg: Config) -> Dict[str, float]:
     x_flat, x_scalar, x_seq, yv, _, _ycv, _ycvd, _ycr = arrays
     model.eval()
@@ -1585,32 +1630,61 @@ def calibrate_micro_escalation_threshold(micro_detector, x_cal: np.ndarray, y_ca
     with torch.no_grad():
         xb = torch.tensor(x_n, dtype=torch.float32, device=cfg.device)
         y_score = torch.sigmoid(model(xb)).cpu().numpy()
-    best = {"threshold": cfg.local_shade_trigger_threshold, "precision": 0.0, "recall": 0.0, "f1": 0.0, "bal_acc": 0.0}
-    for th in np.linspace(0.1, 0.9, 17):
+    candidates = []
+    for th in np.linspace(0.05, 0.95, 37):
         m = compute_local_escalation_metrics(y_cal, y_score, float(th))
-        curr = (m["recall"], m["balanced_accuracy"], m["f1"])
-        prev = (best["recall"], best["bal_acc"], best["f1"])
-        if curr > prev:
-            best = {
-                "threshold": float(th),
-                "precision": float(m["escalation_precision"]),
-                "recall": float(m["escalation_recall"]),
-                "f1": float(m["escalation_f1"]),
-                "bal_acc": float(m["escalation_balanced_accuracy"]),
-            }
+        recall = float(m["escalation_recall"])
+        false_trigger = float(m["false_trigger_rate_non_escalation"])
+        f1 = float(m["escalation_f1"])
+        bal_acc = float(m["escalation_balanced_accuracy"])
+        recall_violation = max(float(cfg.local_track_escalation_recall_threshold) - recall, 0.0)
+        false_trigger_violation = max(false_trigger - float(cfg.local_track_false_escalation_threshold), 0.0)
+        gate_penalty = recall_violation + false_trigger_violation
+        candidates.append({
+            "threshold": float(th),
+            "recall": recall,
+            "false_trigger_rate_non_escalation": false_trigger,
+            "precision": float(m["escalation_precision"]),
+            "f1": f1,
+            "balanced_accuracy": bal_acc,
+            "gate_penalty": float(gate_penalty),
+            "meets_gate": bool((recall_violation <= 0.0) and (false_trigger_violation <= 0.0)),
+            "recall_violation": float(recall_violation),
+            "false_trigger_violation": float(false_trigger_violation),
+        })
+    feasible = [c for c in candidates if c["meets_gate"]]
+    if len(feasible) > 0:
+        best = sorted(
+            feasible,
+            key=lambda c: (-c["recall"], -c["balanced_accuracy"], -c["f1"], c["false_trigger_rate_non_escalation"]),
+        )[0]
+        chosen_reason = "meets_local_gate_and_maximizes_recall_then_balanced_accuracy"
+    else:
+        best = sorted(
+            candidates,
+            key=lambda c: (c["gate_penalty"], -c["recall"], c["false_trigger_rate_non_escalation"], -c["f1"]),
+        )[0]
+        chosen_reason = "no_threshold_meets_both_gates_selected_minimum_gate_violation_penalty"
+    top10 = sorted(
+        candidates,
+        key=lambda c: (c["gate_penalty"], -c["recall"], c["false_trigger_rate_non_escalation"], -c["f1"]),
+    )[:10]
     out = {
         "micro_shade_threshold": float(best["threshold"]),
         "micro_shade_precision": float(best["precision"]),
         "micro_shade_recall": float(best["recall"]),
         "micro_shade_f1": float(best["f1"]),
-        "micro_shade_bal_acc": float(best["bal_acc"]),
+        "micro_shade_bal_acc": float(best["balanced_accuracy"]),
         "micro_escalation_threshold": float(best["threshold"]),
         "micro_escalation_precision": float(best["precision"]),
         "micro_escalation_recall": float(best["recall"]),
         "micro_escalation_f1": float(best["f1"]),
-        "micro_escalation_bal_acc": float(best["bal_acc"]),
+        "micro_escalation_bal_acc": float(best["balanced_accuracy"]),
         "local_escalation_threshold": float(best["threshold"]),
         "local_escalation_trigger_mode": "micro_ml",
+        "micro_escalation_threshold_selection_reason": chosen_reason,
+        "micro_escalation_threshold_candidates_top10": top10,
+        "micro_escalation_threshold_candidates_count": int(len(candidates)),
     }
     return out
 
@@ -2266,6 +2340,37 @@ local_runtime_state_summary = {
 }
 print("\n=== 5A) micro runtime-state summary ===")
 print(local_runtime_state_summary)
+local_state_label_counts = {
+    "train": summarize_local_state_labels(micro_states_exp_train, "train"),
+    "cal": summarize_local_state_labels(micro_states_exp_cal, "cal"),
+    "test": summarize_local_state_labels(micro_states_exp_test, "test"),
+}
+local_state_positive_rate_summary = {
+    "train": local_positive_rate_summaries(micro_states_exp_train, "train"),
+    "cal": local_positive_rate_summaries(micro_states_exp_cal, "cal"),
+    "test": local_positive_rate_summaries(micro_states_exp_test, "test"),
+    "positive_rate_by_model_split": {
+        "train": float(local_state_label_counts["train"]["positive_rate"]),
+        "cal": float(local_state_label_counts["cal"]["positive_rate"]),
+        "test": float(local_state_label_counts["test"]["positive_rate"]),
+    },
+}
+local_label_audit_sample = pd.DataFrame([{
+    "center_v": float(st.get("center_v", np.nan)),
+    "P_local": float(st.get("p_local", np.nan)),
+    "P_global_best": float(st.get("p_global_teacher", np.nan)),
+    "micro_escalate_ratio_threshold": float(cfg.micro_escalate_ratio_threshold),
+    "y_escalate": int(st.get("y_escalate", 0)),
+    "y_shade": int(st.get("y_shade", 0)),
+} for st in micro_states_exp_test[:20]])
+print("\n=== 5A.1) local escalation label counts by split ===")
+print(local_state_label_counts)
+print("\n=== 5A.2) local escalation positive-rate summaries ===")
+print(local_state_positive_rate_summary)
+print("\n=== 5A.3) local escalation label audit sample (test runtime states) ===")
+print(local_label_audit_sample)
+if local_state_label_counts["train"]["n_positive_escalation"] == 0:
+    raise RuntimeError("local escalation label collapse: zero positives in train split; adjust runtime-state generation/threshold.")
 micro_detector_trained = False
 micro_detector_param_count = 0
 micro_detector = None
@@ -2293,6 +2398,12 @@ else:
     for xx in micro_cal_ds["x"]:
         local_scores_cal.append(float(np.clip(0.55 * xx[4] + 0.30 * xx[5] + 0.15 * xx[6], 0.0, 1.0)))
     local_escalation_cal = calibrate_local_shade_trigger_threshold(micro_cal_ds["y"], np.asarray(local_scores_cal, dtype=float), cfg)
+print("\n=== 5B) local escalation threshold calibration (gate-aligned) ===")
+print({
+    "chosen_threshold": float(local_escalation_cal.get("micro_escalation_threshold", local_escalation_cal.get("local_escalation_threshold", cfg.local_shade_trigger_threshold))),
+    "selection_reason": local_escalation_cal.get("micro_escalation_threshold_selection_reason", "legacy_recall_balanced_accuracy"),
+    "top10_candidate_thresholds": local_escalation_cal.get("micro_escalation_threshold_candidates_top10", []),
+})
 if len(micro_cal_ds["x"]):
     local_runtime_scores = np.asarray([
         micro_ml_predict(micro_detector, dict(zip(micro_cal_ds["feature_names"], row)), cfg)
@@ -2425,6 +2536,21 @@ def evaluate_local_detector(rows: List[Dict], cfg: Config, threshold: float, mic
     return y_true, y_score, center_norm, metrics
 
 
+def summarize_score_distribution(y_true: np.ndarray, y_score: np.ndarray) -> Dict[str, Dict[str, float]]:
+    def _stats(arr: np.ndarray) -> Dict[str, float]:
+        if len(arr) == 0:
+            return {"n": 0, "min": np.nan, "mean": np.nan, "max": np.nan}
+        return {
+            "n": int(len(arr)),
+            "min": float(np.min(arr)),
+            "mean": float(np.mean(arr)),
+            "max": float(np.max(arr)),
+        }
+    pos = np.asarray(y_score[np.asarray(y_true, dtype=int) == 1], dtype=float)
+    neg = np.asarray(y_score[np.asarray(y_true, dtype=int) == 0], dtype=float)
+    return {"positive_states": _stats(pos), "negative_states": _stats(neg)}
+
+
 def local_detector_metrics_by_center_band(y_true: np.ndarray, y_score: np.ndarray, center_norm: np.ndarray, threshold: float):
     # ===== MODIFIED SECTION (PATCH 6): local detector stability across operating regions =====
     bands = [(0.55, 0.65), (0.65, 0.75), (0.75, 0.85)]
@@ -2523,6 +2649,59 @@ local_escalation_detector_report = {
 print("\n=== 9C) local escalation detector report (separate from coarse shade head) ===")
 print(local_escalation_detector_report)
 
+# PATCH 1/2: dedicated local escalation diagnostics (label availability, thresholding, confusion, score polarity)
+def _score_micro_dataset(micro_ds: Dict[str, np.ndarray], cfg: Config, micro_detector=None) -> np.ndarray:
+    if len(micro_ds["x"]) == 0:
+        return np.zeros((0,), dtype=float)
+    if cfg.use_micro_ml_detector and micro_detector is not None:
+        feats = micro_ds["x"]
+        return np.asarray([
+            micro_ml_predict(micro_detector, dict(zip(micro_ds["feature_names"], row)), cfg) for row in feats
+        ], dtype=float)
+    return np.asarray([float(np.clip(0.55 * row[4] + 0.30 * row[5] + 0.15 * row[6], 0.0, 1.0)) for row in micro_ds["x"]], dtype=float)
+
+local_scores_train = _score_micro_dataset(micro_train_ds, cfg, micro_detector=mlp_cal.get("micro_detector", None))
+local_scores_cal = _score_micro_dataset(micro_cal_ds, cfg, micro_detector=mlp_cal.get("micro_detector", None))
+local_scores_test = _score_micro_dataset(micro_test_ds, cfg, micro_detector=mlp_cal.get("micro_detector", None))
+local_diag_threshold = float(local_eval_threshold_mlp)
+local_test_metrics_diag = compute_local_escalation_metrics(micro_test_ds["y"], local_scores_test, local_diag_threshold) if len(micro_test_ds["y"]) else {
+    "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0}
+}
+local_escalation_debug_report = {
+    "n_runtime_states": {
+        "train": int(len(micro_train_ds["y"])),
+        "cal": int(len(micro_cal_ds["y"])),
+        "test": int(len(micro_test_ds["y"])),
+    },
+    "n_positive_labels": {
+        "train": int(np.sum(micro_train_ds["y"] == 1)),
+        "cal": int(np.sum(micro_cal_ds["y"] == 1)),
+        "test": int(np.sum(micro_test_ds["y"] == 1)),
+    },
+    "n_negative_labels": {
+        "train": int(np.sum(micro_train_ds["y"] == 0)),
+        "cal": int(np.sum(micro_cal_ds["y"] == 0)),
+        "test": int(np.sum(micro_test_ds["y"] == 0)),
+    },
+    "threshold_chosen": local_diag_threshold,
+    "test_confusion_matrix": local_test_metrics_diag.get("confusion_matrix", {"tn": 0, "fp": 0, "fn": 0, "tp": 0}),
+    "test_positive_score_stats": summarize_score_distribution(micro_test_ds["y"], local_scores_test)["positive_states"],
+    "test_negative_score_stats": summarize_score_distribution(micro_test_ds["y"], local_scores_test)["negative_states"],
+    "train_positive_score_stats": summarize_score_distribution(micro_train_ds["y"], local_scores_train)["positive_states"],
+    "cal_positive_score_stats": summarize_score_distribution(micro_cal_ds["y"], local_scores_cal)["positive_states"],
+    "diagnostic_hypotheses": {
+        "label_collapse": bool(np.sum(micro_train_ds["y"] == 1) == 0 or np.sum(micro_test_ds["y"] == 1) == 0),
+        "score_inversion_suspected": bool(
+            np.isfinite(np.mean(local_scores_test[micro_test_ds["y"] == 1])) and
+            np.isfinite(np.mean(local_scores_test[micro_test_ds["y"] == 0])) and
+            (np.mean(local_scores_test[micro_test_ds["y"] == 1]) < np.mean(local_scores_test[micro_test_ds["y"] == 0]))
+        ) if len(micro_test_ds["y"]) else False,
+        "threshold_miscalibration_suspected": bool(local_test_metrics_diag.get("escalation_recall", 0.0) < cfg.local_track_escalation_recall_threshold),
+    },
+}
+print("\n=== 9D) local escalation detector diagnostics ===")
+print(local_escalation_debug_report)
+
 # all-test comparison table
 # PATCH 2: deterministic row must not use MLP regression metrics
 det_flat = {"mae": np.nan, "rmse": np.nan, "p95": np.nan, "p99": np.nan, "mean_sigma": np.nan}
@@ -2606,6 +2785,7 @@ def _safe_metric(d, k, default=np.nan):
 
 shaded_available = isinstance(sh_mlp, dict) and "average_power_ratio" in sh_mlp
 nonsh_test = [r for r in exp_test_rows if int(r["y_shade"]) == 0]
+test_mode_is_shaded_only = bool(len(exp_test_rows) > 0 and len(nonsh_test) == 0)
 if len(nonsh_test) > 0:
     df_nonsh_det, met_nonsh_det = evaluate_controller(nonsh_test, mode="deterministic", cfg=cfg)
     df_nonsh_mlp, _ = evaluate_controller(nonsh_test, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, cfg=cfg)
@@ -2618,6 +2798,7 @@ if len(nonsh_test) > 0:
     nonsh_vdiff_p99_mlp = float(np.quantile(df_nonsh_mlp["v_diff_pct"], 0.99))
     nonsh_vdiff_p95_cnn = float(np.quantile(df_nonsh_cnn["v_diff_pct"], 0.95))
     nonsh_vdiff_p99_cnn = float(np.quantile(df_nonsh_cnn["v_diff_pct"], 0.99))
+    nonshaded_metrics_status = "evaluated"
 else:
     df_nonsh_det, met_nonsh_det = pd.DataFrame(), {}
     false_trigger_mlp = np.nan
@@ -2626,6 +2807,7 @@ else:
     nonsh_ratio_delta_cnn = np.nan
     nonsh_vdiff_p95_mlp = nonsh_vdiff_p99_mlp = np.nan
     nonsh_vdiff_p95_cnn = nonsh_vdiff_p99_cnn = np.nan
+    nonshaded_metrics_status = "not_available_due_to_shaded_only_test" if test_mode_is_shaded_only else "not_available_no_nonshaded_rows"
 
 score_mlp = _safe_metric(sh_mlp, "average_power_ratio", met_mlp["average_power_ratio"])
 score_cnn = _safe_metric(sh_cnn, "average_power_ratio", met_cnn["average_power_ratio"])
@@ -2642,8 +2824,9 @@ no_catastrophic_p99 = _safe_metric(pref_metrics, "p99_voltage_percent_difference
 acceptable_fallback = _safe_metric(pref_metrics, "fallback_rate", 1.0) <= 0.35
 drift_clear = not bool(pref_drift.get("drift_alert", True))
 beats_det = pref_gain > 0.0
-nonsh_no_harm = (not np.isfinite(pref_nonsh_delta)) or (pref_nonsh_delta >= -cfg.nonshaded_no_harm_tolerance)
-nonsh_false_trigger_gate = (not np.isfinite(pref_false_trigger)) or (pref_false_trigger <= 0.05)
+nonsh_metrics_available = bool(np.isfinite(pref_nonsh_delta) and np.isfinite(pref_false_trigger) and np.isfinite(pref_nonsh_v95) and np.isfinite(pref_nonsh_v99))
+nonsh_no_harm = bool(pref_nonsh_delta >= -cfg.nonshaded_no_harm_tolerance) if nonsh_metrics_available else None
+nonsh_false_trigger_gate = bool(pref_false_trigger <= 0.05) if nonsh_metrics_available else None
 ml_worth_it = bool(beats_det and no_catastrophic_p99)
 compute_feasible = True  # replaced after compute profiling block
 dynamic_proxy_eff = np.nan
@@ -2668,8 +2851,8 @@ research_recommended = bool(
     beats_det
     and no_catastrophic_p99
     and acceptable_fallback
-    and nonsh_no_harm
-    and nonsh_false_trigger_gate
+    and (True if nonsh_no_harm is None else bool(nonsh_no_harm))
+    and (True if nonsh_false_trigger_gate is None else bool(nonsh_false_trigger_gate))
     and local_track_gate
 )
 pilot_ready = bool(
@@ -2680,8 +2863,8 @@ pilot_ready = bool(
 )
 strict_gates = {
     "shaded_gain_vs_baseline_gt_zero": bool(pref_gain > 0.0),
-    "nonshaded_no_harm_gate": bool(nonsh_no_harm),
-    "false_trigger_gate": bool(nonsh_false_trigger_gate),
+    "nonshaded_no_harm_gate": ("not_evaluated_in_current_test_mode" if nonsh_no_harm is None else bool(nonsh_no_harm)),
+    "false_trigger_gate": ("not_evaluated_in_current_test_mode" if nonsh_false_trigger_gate is None else bool(nonsh_false_trigger_gate)),
     "p99_vdiff_gate": bool(no_catastrophic_p99),
     "fallback_gate": bool(acceptable_fallback),
     "drift_clear": bool(drift_clear),
@@ -2700,18 +2883,19 @@ strict_gates = {
 }
 industry_ready = False
 deployable = bool(industry_ready if not cfg.research_only_mode else research_recommended)
+fallback_breakdown_report = {"status": "pending_preferred_model_breakdown"}
 final_recommendation = {
     "ml_worth_it": ml_worth_it,
     "preferred_model": preferred_model,
     "reason_preferred": "higher_shaded_power_ratio_with_safety_checks",
     "shaded_gain_vs_baseline": float(pref_gain),
-    "nonshaded_delta_vs_baseline": float(pref_nonsh_delta) if np.isfinite(pref_nonsh_delta) else np.nan,
+    "nonshaded_delta_vs_baseline": float(pref_nonsh_delta) if np.isfinite(pref_nonsh_delta) else "not_available_due_to_shaded_only_test",
     "p95_vdiff_preferred": _safe_metric(pref_metrics, "p95_voltage_percent_difference", np.nan),
     "p99_vdiff_preferred": _safe_metric(pref_metrics, "p99_voltage_percent_difference", np.nan),
     "fallback_rate_preferred": _safe_metric(pref_metrics, "fallback_rate", np.nan),
-    "false_trigger_rate_non_shaded_preferred": float(pref_false_trigger) if np.isfinite(pref_false_trigger) else np.nan,
-    "p95_vdiff_non_shaded_preferred": float(pref_nonsh_v95) if np.isfinite(pref_nonsh_v95) else np.nan,
-    "p99_vdiff_non_shaded_preferred": float(pref_nonsh_v99) if np.isfinite(pref_nonsh_v99) else np.nan,
+    "false_trigger_rate_non_shaded_preferred": float(pref_false_trigger) if np.isfinite(pref_false_trigger) else "not_available_due_to_shaded_only_test",
+    "p95_vdiff_non_shaded_preferred": float(pref_nonsh_v95) if np.isfinite(pref_nonsh_v95) else "not_available_due_to_shaded_only_test",
+    "p99_vdiff_non_shaded_preferred": float(pref_nonsh_v99) if np.isfinite(pref_nonsh_v99) else "not_available_due_to_shaded_only_test",
     "drift_clear": bool(drift_clear),
     "compute_feasible": bool(compute_feasible),
     "static_efficiency_proxy": float(static_proxy_eff) if np.isfinite(static_proxy_eff) else np.nan,
@@ -2727,6 +2911,11 @@ final_recommendation = {
     "local_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
     "strict_gate_status": strict_gates,
+    "nonshaded_metrics_status": nonshaded_metrics_status,
+    "heldout_test_mode": ("shaded_only" if test_mode_is_shaded_only else "mixed_or_nonshaded_present"),
+    "shaded_test_recommendation": bool(research_recommended),
+    "full_deployment_recommendation": False,
+    "fallback_breakdown_report": fallback_breakdown_report,
     "research_recommended": bool(research_recommended),
     "pilot_ready": bool(pilot_ready),
     "industry_ready": bool(industry_ready),
@@ -2754,6 +2943,35 @@ n_test_shaded = int(sum(int(r["y_shade"]) == 1 for r in exp_test_rows))
 n_test_ok = int(n_test_total - n_test_shaded)
 fallback_counts_mlp = df_mlp["fallback_reason"].value_counts(dropna=False).to_dict() if len(df_mlp) else {}
 fallback_counts_cnn = df_cnn["fallback_reason"].value_counts(dropna=False).to_dict() if len(df_cnn) else {}
+df_pref = df_mlp if preferred_model == "hybrid_mlp" else df_cnn
+fallback_breakdown_report = {"note": "no rows"} if len(df_pref) == 0 else {}
+if len(df_pref) > 0:
+    fallback_reason_counts = df_pref["fallback_reason"].value_counts(dropna=False).to_dict() if "fallback_reason" in df_pref else {}
+    fallback_reason_pct = {str(k): float(v / max(len(df_pref), 1)) for k, v in fallback_reason_counts.items()}
+    fallback_by_shade = df_pref.groupby("y_shade")["fallback"].mean().to_dict() if ("y_shade" in df_pref and "fallback" in df_pref) else {}
+    if "confidence" in df_pref:
+        conf_bins = pd.cut(df_pref["confidence"], bins=[-1e-9, 0.25, 0.50, 0.75, 1.01], labels=["0.00-0.25", "0.25-0.50", "0.50-0.75", "0.75-1.00"])
+        fallback_by_conf = df_pref.groupby(conf_bins)["fallback"].mean().to_dict()
+    else:
+        fallback_by_conf = {}
+    if "local_escalation_score" in df_pref:
+        local_bins = pd.cut(df_pref["local_escalation_score"], bins=[-1e-9, 0.25, 0.50, 0.75, 1.01], labels=["0.00-0.25", "0.25-0.50", "0.50-0.75", "0.75-1.00"])
+        fallback_by_local_trigger = df_pref.groupby(local_bins)["fallback"].mean().to_dict()
+    else:
+        fallback_by_local_trigger = {}
+    fallback_breakdown_report = {
+        "preferred_model": preferred_model,
+        "fallback_reason_counts": {str(k): int(v) for k, v in fallback_reason_counts.items()},
+        "fallback_reason_percentages": {str(k): float(v) for k, v in fallback_reason_pct.items()},
+        "fallback_rate_by_shaded_vs_nonshaded": {
+            ("nonshaded" if int(k) == 0 else "shaded"): float(v) for k, v in fallback_by_shade.items()
+        },
+        "fallback_rate_by_candidate_confidence_bucket": {str(k): float(v) for k, v in fallback_by_conf.items() if pd.notna(k)},
+        "fallback_rate_by_local_detector_trigger_bucket": {str(k): float(v) for k, v in fallback_by_local_trigger.items() if pd.notna(k)},
+    }
+print("\n=== 12B) fallback breakdown report (preferred model) ===")
+print(fallback_breakdown_report)
+final_recommendation["fallback_breakdown_report"] = fallback_breakdown_report
 print("\n=== A) calibration diagnostics ===")
 print({
     "uncertainty_calibration": {"mlp": mlp_cal, "cnn": cnn_cal},
@@ -2947,8 +3165,16 @@ final_recommendation["architecture_summary_text"] = (
 )
 final_recommendation["strict_gate_status"] = {
     "shaded_gain_vs_baseline_gt_zero": bool(final_recommendation["shaded_gain_vs_baseline"] > 0.0),
-    "nonshaded_no_harm_gate": bool(final_recommendation["nonshaded_delta_vs_baseline"] >= -cfg.nonshaded_no_harm_tolerance),
-    "false_trigger_gate": bool(final_recommendation["false_trigger_rate_non_shaded_preferred"] <= 0.05),
+    "nonshaded_no_harm_gate": (
+        "not_evaluated_in_current_test_mode"
+        if not isinstance(final_recommendation["nonshaded_delta_vs_baseline"], (int, float, np.floating))
+        else bool(final_recommendation["nonshaded_delta_vs_baseline"] >= -cfg.nonshaded_no_harm_tolerance)
+    ),
+    "false_trigger_gate": (
+        "not_evaluated_in_current_test_mode"
+        if not isinstance(final_recommendation["false_trigger_rate_non_shaded_preferred"], (int, float, np.floating))
+        else bool(final_recommendation["false_trigger_rate_non_shaded_preferred"] <= 0.05)
+    ),
     "p99_vdiff_gate": bool(final_recommendation["p99_vdiff_preferred"] <= 20.0),
     "fallback_gate": bool(final_recommendation["fallback_rate_preferred"] <= 0.35),
     "drift_clear": bool(final_recommendation["drift_clear"]),
@@ -2969,6 +3195,14 @@ final_recommendation["strict_gate_status"] = {
     "hil_validated": bool(hil_validated),
     "frozen_firmware_release_evidence": bool(frozen_firmware_release_evidence),
 }
+final_recommendation["shaded_test_recommendation"] = bool(
+    final_recommendation["strict_gate_status"]["shaded_gain_vs_baseline_gt_zero"]
+    and final_recommendation["strict_gate_status"]["p99_vdiff_gate"]
+    and final_recommendation["strict_gate_status"]["fallback_gate"]
+    and final_recommendation["strict_gate_status"]["coarse_scan_detector_gate"]
+    and final_recommendation["strict_gate_status"]["local_track_detector_gate"]
+)
+final_recommendation["full_deployment_recommendation"] = bool(industry_ready)
 print("\n=== H) final recommendation (strict deployability gates) ===")
 print(final_recommendation)
 # ===== MODIFIED SECTION (PATCH 4): explicit final architecture status =====
@@ -3145,6 +3379,9 @@ if SAVE_MODEL_BUNDLE:
         "shade_detection_modes": shade_detection_modes,
         "shade_detector_report": shade_detector_report,
         "local_escalation_detector_report": local_escalation_detector_report,
+        "local_escalation_debug_report": local_escalation_debug_report,
+        "local_state_label_counts": local_state_label_counts,
+        "local_state_positive_rate_summary": local_state_positive_rate_summary,
         "drift_baselines": {"mlp": drift_baseline_mlp, "cnn": drift_baseline_cnn},
         "drift_thresholds": {
             "window": cfg.drift_window,
@@ -3155,6 +3392,7 @@ if SAVE_MODEL_BUNDLE:
         },
         "drift_summary": drift_summary,
         "fallback_reason_counts": {"mlp": fallback_counts_mlp, "cnn": fallback_counts_cnn},
+        "fallback_breakdown_report_preferred": fallback_breakdown_report,
         "false_trigger_metrics": {
             "mlp": false_trigger_mlp,
             "cnn": false_trigger_cnn,
