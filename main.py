@@ -91,6 +91,8 @@ class Config:
     local_trigger_rollout_steps: int = 2
     local_runtime_rollout_start_fracs: Tuple[float, ...] = (0.62, 0.72, 0.82)
     micro_escalate_ratio_threshold: float = 1.01
+    local_track_false_escalation_threshold: float = 0.10
+    local_track_escalation_recall_threshold: float = 0.75
     micro_pretrain_epochs: int = 35
     micro_finetune_epochs: int = 25
     micro_batch_size: int = 128
@@ -836,10 +838,15 @@ def calibrate_local_shade_trigger_threshold(y_true: np.ndarray, y_score: np.ndar
     if len(y_score) == 0:
         return {
             "local_shade_trigger_threshold": float(cfg.local_shade_trigger_threshold),
+            "local_escalation_trigger_threshold": float(cfg.local_shade_trigger_threshold),
             "local_shade_precision": 0.0,
             "local_shade_recall": 0.0,
             "local_shade_f1": 0.0,
             "local_shade_bal_acc": 0.0,
+            "local_escalation_precision": 0.0,
+            "local_escalation_recall": 0.0,
+            "local_escalation_f1": 0.0,
+            "local_escalation_bal_acc": 0.0,
             "local_trigger_calibration_mode": "runtime_rollout_state_samples",
         }
     best = {
@@ -850,23 +857,28 @@ def calibrate_local_shade_trigger_threshold(y_true: np.ndarray, y_score: np.ndar
         "bal_acc": 0.0,
     }
     for th in np.linspace(0.1, 0.9, 17):
-        m = compute_binary_metrics(y_true, y_score, float(th))
+        m = compute_local_escalation_metrics(y_true, y_score, float(th))
         curr = (m["recall"], m["balanced_accuracy"], m["f1"])
         prev = (best["recall"], best["bal_acc"], best["f1"])
         if curr > prev:
             best = {
                 "threshold": float(th),
-                "precision": float(m["precision"]),
-                "recall": float(m["recall"]),
-                "f1": float(m["f1"]),
-                "bal_acc": float(m["balanced_accuracy"]),
+                "precision": float(m["escalation_precision"]),
+                "recall": float(m["escalation_recall"]),
+                "f1": float(m["escalation_f1"]),
+                "bal_acc": float(m["escalation_balanced_accuracy"]),
             }
     return {
         "local_shade_trigger_threshold": best["threshold"],
+        "local_escalation_trigger_threshold": best["threshold"],
         "local_shade_precision": best["precision"],
         "local_shade_recall": best["recall"],
         "local_shade_f1": best["f1"],
         "local_shade_bal_acc": best["bal_acc"],
+        "local_escalation_precision": best["precision"],
+        "local_escalation_recall": best["recall"],
+        "local_escalation_f1": best["f1"],
+        "local_escalation_bal_acc": best["bal_acc"],
         "local_trigger_calibration_mode": "runtime_rollout_state_samples",
     }
 
@@ -942,8 +954,8 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
     }
 
 
-def compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> Dict[str, float]:
-    """PATCH 4: explicit binary detector metrics helper."""
+def compute_binary_confusion_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> Dict[str, float]:
+    """Shared binary metrics core used by coarse shade and local escalation reports."""
     y_t = np.asarray(y_true, dtype=int)
     y_s = np.asarray(y_score, dtype=float)
     y_h = (y_s >= float(threshold)).astype(int)
@@ -956,8 +968,6 @@ def compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: f
     f1 = 2 * precision * recall / max(precision + recall, 1e-9)
     tnr = tn / max(tn + fp, 1)
     bal_acc = 0.5 * (recall + tnr)
-    false_trigger_nonshaded = fp / max(fp + tn, 1)
-    missed_escalation_rate = fn / max(fn + tp, 1)
     return {
         "threshold": float(threshold),
         "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
@@ -965,9 +975,41 @@ def compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: f
         "recall": float(recall),
         "f1": float(f1),
         "balanced_accuracy": float(bal_acc),
-        "false_trigger_rate_non_shaded": float(false_trigger_nonshaded),
-        "missed_escalation_rate": float(missed_escalation_rate),
     }
+
+
+def compute_shade_detector_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> Dict[str, float]:
+    """Coarse-scan shade detector metrics (non-shaded semantics)."""
+    m = compute_binary_confusion_metrics(y_true, y_score, threshold)
+    cm = m["confusion_matrix"]
+    m["false_trigger_rate_non_shaded"] = float(cm["fp"] / max(cm["fp"] + cm["tn"], 1))
+    return m
+
+
+def compute_local_escalation_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> Dict[str, float]:
+    """Local detector metrics (escalation semantics only)."""
+    m = compute_binary_confusion_metrics(y_true, y_score, threshold)
+    cm = m["confusion_matrix"]
+    escalation_precision = float(m["precision"])
+    escalation_recall = float(m["recall"])
+    escalation_f1 = float(m["f1"])
+    escalation_bal_acc = float(m["balanced_accuracy"])
+    false_trigger_non_escalation = float(cm["fp"] / max(cm["fp"] + cm["tn"], 1))
+    missed_escalation_rate = float(cm["fn"] / max(cm["fn"] + cm["tp"], 1))
+    m.update({
+        "false_trigger_rate_non_escalation": false_trigger_non_escalation,
+        "missed_escalation_rate": missed_escalation_rate,
+        "escalation_precision": escalation_precision,
+        "escalation_recall": escalation_recall,
+        "escalation_f1": escalation_f1,
+        "escalation_balanced_accuracy": escalation_bal_acc,
+        # backward-compatible aliases
+        "precision": escalation_precision,
+        "recall": escalation_recall,
+        "f1": escalation_f1,
+        "balanced_accuracy": escalation_bal_acc,
+    })
+    return m
 
 
 def uncertainty_diagnostics(model, arrays, calib, cfg: Config) -> Dict[str, float]:
@@ -1109,17 +1151,19 @@ def build_micro_scan_features(oracle: CurveOracle, center_v: float, cfg: Config)
     p0 = float(vm * oracle.measure(vm))
     pl = float(vl * oracle.measure(vl))
     pr = float(vr * oracle.measure(vr))
+    p_vi_scale = float(max(oracle.voc * oracle.isc, 1e-9))
     local_spread = abs(pr - pl) / max(p0, 1e-9)
     local_dip = max((0.5 * (pl + pr) - p0) / max(p0, 1e-9), 0.0)
     curvature = max((pl + pr - 2.0 * p0) / max(p0, 1e-9), 0.0)
     return {
         "vm_norm": float(vm / max(oracle.voc, 1e-9)),
-        "pl_norm": float(pl / max(oracle.pmpp_true, 1e-9)),
-        "p0_norm": float(p0 / max(oracle.pmpp_true, 1e-9)),
-        "pr_norm": float(pr / max(oracle.pmpp_true, 1e-9)),
+        "pl_norm": float(pl / p_vi_scale),
+        "p0_norm": float(p0 / p_vi_scale),
+        "pr_norm": float(pr / p_vi_scale),
         "local_spread": float(local_spread),
         "local_dip": float(local_dip),
         "curvature": float(curvature),
+        "micro_feature_runtime_safe": True,
     }
 
 
@@ -1169,7 +1213,7 @@ def augment_micro_features(x_train: np.ndarray, cfg: Config) -> np.ndarray:
     return x_aug.astype(np.float32)
 
 
-def train_micro_shade_detector(x_train: np.ndarray, y_train: np.ndarray, cfg: Config, epochs: int):
+def train_micro_local_escalation_detector(x_train: np.ndarray, y_train: np.ndarray, cfg: Config, epochs: int):
     """PATCH 2: train tiny local escalation MLP (<=5k params)."""
     x_t = np.asarray(x_train, dtype=np.float32)
     y_t = np.asarray(y_train, dtype=np.float32)
@@ -1193,7 +1237,7 @@ def train_micro_shade_detector(x_train: np.ndarray, y_train: np.ndarray, cfg: Co
     return {"model": model, "param_count": param_count}
 
 
-def finetune_micro_shade_detector(model, x_train: np.ndarray, y_train: np.ndarray, cfg: Config, epochs: int):
+def finetune_micro_local_escalation_detector(model, x_train: np.ndarray, y_train: np.ndarray, cfg: Config, epochs: int):
     """PATCH 2: finetune local escalation detector on experimental runtime states."""
     x_t = np.asarray(x_train, dtype=np.float32)
     y_t = np.asarray(y_train, dtype=np.float32)
@@ -1227,7 +1271,7 @@ def micro_ml_predict(micro_detector, micro_features: Dict[str, float], cfg: Conf
     return float(prob)
 
 
-def calibrate_micro_shade_threshold(micro_detector, x_cal: np.ndarray, y_cal: np.ndarray, cfg: Config) -> Dict[str, float]:
+def calibrate_micro_escalation_threshold(micro_detector, x_cal: np.ndarray, y_cal: np.ndarray, cfg: Config) -> Dict[str, float]:
     x_n = (x_cal - micro_detector["standardizer"]["mu"]) / micro_detector["standardizer"]["sd"]
     model = micro_detector["model"]
     model.eval()
@@ -1236,16 +1280,16 @@ def calibrate_micro_shade_threshold(micro_detector, x_cal: np.ndarray, y_cal: np
         y_score = torch.sigmoid(model(xb)).cpu().numpy()
     best = {"threshold": cfg.local_shade_trigger_threshold, "precision": 0.0, "recall": 0.0, "f1": 0.0, "bal_acc": 0.0}
     for th in np.linspace(0.1, 0.9, 17):
-        m = compute_binary_metrics(y_cal, y_score, float(th))
+        m = compute_local_escalation_metrics(y_cal, y_score, float(th))
         curr = (m["recall"], m["balanced_accuracy"], m["f1"])
         prev = (best["recall"], best["bal_acc"], best["f1"])
         if curr > prev:
             best = {
                 "threshold": float(th),
-                "precision": float(m["precision"]),
-                "recall": float(m["recall"]),
-                "f1": float(m["f1"]),
-                "bal_acc": float(m["balanced_accuracy"]),
+                "precision": float(m["escalation_precision"]),
+                "recall": float(m["escalation_recall"]),
+                "f1": float(m["escalation_f1"]),
+                "bal_acc": float(m["escalation_balanced_accuracy"]),
             }
     out = {
         "micro_shade_threshold": float(best["threshold"]),
@@ -1260,6 +1304,12 @@ def calibrate_micro_shade_threshold(micro_detector, x_cal: np.ndarray, y_cal: np
         "micro_escalation_bal_acc": float(best["bal_acc"]),
     }
     return out
+
+
+# Backward-compatible aliases
+train_micro_shade_detector = train_micro_local_escalation_detector
+finetune_micro_shade_detector = finetune_micro_local_escalation_detector
+calibrate_micro_shade_threshold = calibrate_micro_escalation_threshold
 
 
 def run_deterministic_baseline(oracle: CurveOracle, cfg: Config) -> Dict[str, float]:
@@ -1319,23 +1369,23 @@ def run_hybrid_ml_controller(
     p_left = float(local_left * oracle.measure(local_left))
     p_right = float(local_right * oracle.measure(local_right))
     local_spread = abs(p_right - p_left) / max(local_p, 1e-9)
-    local_shade_trigger_mode = "deterministic_heuristic"
-    local_shade_score = microscan_shade_heuristic_score(oracle, local_v, cfg)
+    local_escalation_trigger_mode = "deterministic_heuristic"
+    local_escalation_score = microscan_shade_heuristic_score(oracle, local_v, cfg)
     if cfg.use_micro_ml_detector and isinstance(calib.get("micro_detector", None), dict):
         micro_features = build_micro_scan_features(oracle, local_v, cfg)
-        local_shade_score = micro_ml_predict(calib["micro_detector"], micro_features, cfg)
-        local_shade_trigger_mode = "micro_ml"
+        local_escalation_score = micro_ml_predict(calib["micro_detector"], micro_features, cfg)
+        local_escalation_trigger_mode = "micro_ml"
 
     prev_p = float(runtime_state.get("last_power", local_p))
     anomaly_trigger = int(local_p < cfg.anomaly_drop_ratio * max(prev_p, 1e-9))
     periodic_safety_trigger = int((episode_idx + 1) % max(cfg.periodic_safety_interval, 1) == 0)
-    local_shade_trigger_threshold = float(
+    local_escalation_trigger_threshold = float(
         calib.get(
-            "micro_shade_threshold" if local_shade_trigger_mode == "micro_ml" else "local_shade_trigger_threshold",
+            "micro_escalation_threshold" if local_escalation_trigger_mode == "micro_ml" else "local_escalation_trigger_threshold",
             cfg.local_shade_trigger_threshold,
         )
     )
-    shade_trigger_local = int(local_shade_score >= local_shade_trigger_threshold)
+    shade_trigger_local = int(local_escalation_score >= local_escalation_trigger_threshold)
     enter_shade_mode = bool(shade_trigger_local or periodic_safety_trigger or anomaly_trigger)
     mode = "SHADE_GMPPT" if enter_shade_mode else "LOCAL_TRACK"
 
@@ -1348,12 +1398,14 @@ def run_hybrid_ml_controller(
         "sigma": 0.0,
         "raw_sigma": 0.0,
         "shade_flag": shade_trigger_local,
-        "local_shade_score": local_shade_score,
+        "local_escalation_score": local_escalation_score,
+        "local_shade_score": local_escalation_score,
         "V_candidates": [local_v / max(oracle.voc, 1e-9)],
-        "candidate_scores": [1.0 - local_shade_score],
+        "candidate_scores": [1.0 - local_escalation_score],
         "candidate_disagreement": 0.0,
         "candidate_scores_are_model_predicted": False,
-        "local_shade_trigger_mode": local_shade_trigger_mode,
+        "local_escalation_trigger_mode": local_escalation_trigger_mode,
+        "local_shade_trigger_mode": local_escalation_trigger_mode,
     }
     coarse_multipeak = 0
     low_confidence = 0
@@ -1466,10 +1518,14 @@ def run_hybrid_ml_controller(
         "raw_sigma_vhat": pred["raw_sigma"],
         "shade_flag": int(pred["shade_flag"]),
         "shade_prob_deprecated_alias": float(pred.get("shade_prob", np.nan)),
-        "local_shade_score": float(local_shade_score),
+        "local_escalation_score": float(local_escalation_score),
+        "local_shade_score": float(local_escalation_score),
         "local_shade_triggered": int(shade_trigger_local),
-        "local_shade_trigger_threshold": float(local_shade_trigger_threshold),
-        "local_shade_trigger_mode": local_shade_trigger_mode,
+        "local_escalation_triggered": int(shade_trigger_local),
+        "local_escalation_trigger_threshold": float(local_escalation_trigger_threshold),
+        "local_shade_trigger_threshold": float(local_escalation_trigger_threshold),
+        "local_escalation_trigger_mode": local_escalation_trigger_mode,
+        "local_shade_trigger_mode": local_escalation_trigger_mode,
         "coarse_multipeak": coarse_multipeak,
         "low_confidence": low_confidence,
         "sanity_trigger": sanity_trigger,
@@ -1480,8 +1536,9 @@ def run_hybrid_ml_controller(
         "best_candidate_post_refine_power": float(best_candidate_post_refine_power),
         "periodic_safety_trigger": periodic_safety_trigger,
         "anomaly_trigger": anomaly_trigger,
-        "local_shade_trigger_ml": 0,
-        "local_shade_trigger_heuristic": shade_trigger_local,
+        "local_shade_trigger_ml": int(shade_trigger_local) if local_escalation_trigger_mode == "micro_ml" else 0,
+        "local_shade_trigger_heuristic": 0 if local_escalation_trigger_mode == "micro_ml" else int(shade_trigger_local),
+        "micro_feature_runtime_safe": True,
         "local_spread": float(local_spread),
         "mean_candidate_score": float(mean_cand_score),
         "candidate_score_min": float(min_cand_score),
@@ -1889,18 +1946,18 @@ if cfg.use_micro_ml_detector and len(micro_train_ds["x"]) > 0 and len(micro_cal_
     )
     train_sim_x_n = (micro_train_ds_sim["x"] - micro_stdz["mu"]) / micro_stdz["sd"] if len(micro_train_ds_sim["x"]) else np.zeros((0, len(micro_train_ds["feature_names"])), dtype=np.float32)
     train_exp_x_n = (micro_train_ds["x"] - micro_stdz["mu"]) / micro_stdz["sd"]
-    micro_fit = train_micro_shade_detector(train_sim_x_n, micro_train_ds_sim["y"], cfg, epochs=cfg.micro_pretrain_epochs) if len(train_sim_x_n) else train_micro_shade_detector(train_exp_x_n, micro_train_ds["y"], cfg, epochs=max(1, cfg.micro_pretrain_epochs // 2))
-    micro_model = finetune_micro_shade_detector(micro_fit["model"], train_exp_x_n, micro_train_ds["y"], cfg, epochs=cfg.micro_finetune_epochs)
+    micro_fit = train_micro_local_escalation_detector(train_sim_x_n, micro_train_ds_sim["y"], cfg, epochs=cfg.micro_pretrain_epochs) if len(train_sim_x_n) else train_micro_local_escalation_detector(train_exp_x_n, micro_train_ds["y"], cfg, epochs=max(1, cfg.micro_pretrain_epochs // 2))
+    micro_model = finetune_micro_local_escalation_detector(micro_fit["model"], train_exp_x_n, micro_train_ds["y"], cfg, epochs=cfg.micro_finetune_epochs)
     micro_detector = {
         "model": micro_model,
         "param_count": int(micro_fit["param_count"]),
         "standardizer": micro_stdz,
         "feature_names": micro_train_ds["feature_names"],
-        "task": "local_quick_shade_escalation_detector",
+        "task": "micro_local_escalation_detector",
     }
     micro_detector_trained = True
     micro_detector_param_count = int(micro_fit["param_count"])
-    local_shade_cal = calibrate_micro_shade_threshold(micro_detector, micro_cal_ds["x"], micro_cal_ds["y"], cfg)
+    local_shade_cal = calibrate_micro_escalation_threshold(micro_detector, micro_cal_ds["x"], micro_cal_ds["y"], cfg)
 else:
     local_scores_cal = []
     for xx in micro_cal_ds["x"]:
@@ -1912,21 +1969,25 @@ if len(micro_cal_ds["x"]):
         if (cfg.use_micro_ml_detector and micro_detector is not None) else float(np.clip(0.55 * row[4] + 0.30 * row[5] + 0.15 * row[6], 0.0, 1.0))
         for row in micro_cal_ds["x"]
     ], dtype=float)
-    local_runtime_detector_metrics = compute_binary_metrics(
+    local_runtime_detector_metrics = compute_local_escalation_metrics(
         micro_cal_ds["y"],
         local_runtime_scores,
-        float(local_shade_cal.get("micro_shade_threshold", local_shade_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))),
+        float(local_shade_cal.get("micro_escalation_threshold", local_shade_cal.get("local_escalation_trigger_threshold", cfg.local_shade_trigger_threshold))),
     )
 else:
     local_runtime_detector_metrics = {
-        "threshold": float(local_shade_cal.get("micro_shade_threshold", local_shade_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))),
+        "threshold": float(local_shade_cal.get("micro_escalation_threshold", local_shade_cal.get("local_escalation_trigger_threshold", cfg.local_shade_trigger_threshold))),
         "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0},
         "precision": 0.0,
         "recall": 0.0,
         "f1": 0.0,
         "balanced_accuracy": 0.0,
-        "false_trigger_rate_non_shaded": 0.0,
+        "false_trigger_rate_non_escalation": 0.0,
         "missed_escalation_rate": 0.0,
+        "escalation_precision": 0.0,
+        "escalation_recall": 0.0,
+        "escalation_f1": 0.0,
+        "escalation_balanced_accuracy": 0.0,
     }
 local_runtime_detector_metrics["n_states"] = int(len(micro_cal_ds["x"]))
 local_runtime_detector_metrics["split"] = "exp_cal_rows_runtime_states"
@@ -1942,6 +2003,7 @@ mlp_cal.update({
     "micro_runtime_state_summary": local_runtime_state_summary,
     "local_runtime_detector_metrics": local_runtime_detector_metrics,
     "micro_detector": micro_detector,
+    "micro_feature_runtime_safe": True,
 })
 cnn_cal.update({
     "micro_ml_detector_trained": bool(micro_detector_trained),
@@ -1951,6 +2013,7 @@ cnn_cal.update({
     "micro_runtime_state_summary": local_runtime_state_summary,
     "local_runtime_detector_metrics": local_runtime_detector_metrics,
     "micro_detector": micro_detector,
+    "micro_feature_runtime_safe": True,
 })
 # PATCH 3: candidate score threshold calibration (safety-oriented accept gate).
 mlp_candidate_cal = calibrate_candidate_score_threshold(mlp, exp_cal_rows, stdz, mlp_cal, cfg)
@@ -2024,7 +2087,7 @@ def evaluate_local_detector(rows: List[Dict], cfg: Config, threshold: float, mic
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
     center_norm = np.asarray(center_norm, dtype=float)
-    metrics = compute_binary_metrics(y_true, y_score, threshold)
+    metrics = compute_local_escalation_metrics(y_true, y_score, threshold)
     return y_true, y_score, center_norm, metrics
 
 
@@ -2038,24 +2101,24 @@ def local_detector_metrics_by_center_band(y_true: np.ndarray, y_score: np.ndarra
         if int(np.sum(mask)) == 0:
             out[key] = {"n": 0, "note": "no samples in band"}
             continue
-        m = compute_binary_metrics(y_true[mask], y_score[mask], threshold)
+        m = compute_local_escalation_metrics(y_true[mask], y_score[mask], threshold)
         out[key] = {
             "n": int(np.sum(mask)),
-            "precision": float(m["precision"]),
-            "recall": float(m["recall"]),
-            "f1": float(m["f1"]),
-            "balanced_accuracy": float(m["balanced_accuracy"]),
-            "false_trigger_rate_non_shaded": float(m["false_trigger_rate_non_shaded"]),
+            "escalation_precision": float(m["escalation_precision"]),
+            "escalation_recall": float(m["escalation_recall"]),
+            "escalation_f1": float(m["escalation_f1"]),
+            "escalation_balanced_accuracy": float(m["escalation_balanced_accuracy"]),
+            "false_trigger_rate_non_escalation": float(m["false_trigger_rate_non_escalation"]),
         }
     return out
 
 
 y_true_mlp, y_score_mlp = evaluate_coarse_shade_head(mlp, exp_test_arrays, cfg)
 y_true_cnn, y_score_cnn = evaluate_coarse_shade_head(cnn, exp_test_arrays, cfg)
-local_trigger_threshold_mlp = float(mlp_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))
-local_trigger_threshold_cnn = float(cnn_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))
-local_eval_threshold_mlp = float(mlp_cal.get("micro_shade_threshold", local_trigger_threshold_mlp)) if cfg.use_micro_ml_detector else local_trigger_threshold_mlp
-local_eval_threshold_cnn = float(cnn_cal.get("micro_shade_threshold", local_trigger_threshold_cnn)) if cfg.use_micro_ml_detector else local_trigger_threshold_cnn
+local_trigger_threshold_mlp = float(mlp_cal.get("local_escalation_trigger_threshold", mlp_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold)))
+local_trigger_threshold_cnn = float(cnn_cal.get("local_escalation_trigger_threshold", cnn_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold)))
+local_eval_threshold_mlp = float(mlp_cal.get("micro_escalation_threshold", local_trigger_threshold_mlp)) if cfg.use_micro_ml_detector else local_trigger_threshold_mlp
+local_eval_threshold_cnn = float(cnn_cal.get("micro_escalation_threshold", local_trigger_threshold_cnn)) if cfg.use_micro_ml_detector else local_trigger_threshold_cnn
 y_true_local, y_score_local, center_norm_local, local_metrics_mlp = evaluate_local_detector(
     exp_test_rows,
     cfg,
@@ -2072,12 +2135,17 @@ local_center_band_metrics_mlp = local_detector_metrics_by_center_band(y_true_loc
 local_center_band_metrics_cnn = local_detector_metrics_by_center_band(y_true_local, y_score_local, center_norm_local, local_eval_threshold_cnn)
 shade_detection_modes = {
     "coarse_scan_detector_mode": "ml_classifier",
-    "local_track_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
+    "local_track_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
+    "local_track_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
     "coarse_scan_detector_thresholds": {
         "mlp": float(mlp_cal["shade_threshold"]),
         "cnn": float(cnn_cal["shade_threshold"]),
     },
-    "local_track_trigger_threshold": {
+    "local_track_escalation_threshold": {
+        "mlp": local_eval_threshold_mlp,
+        "cnn": local_eval_threshold_cnn,
+    },
+    "local_track_trigger_threshold": {  # backward-compatible alias
         "mlp": local_eval_threshold_mlp,
         "cnn": local_eval_threshold_cnn,
     },
@@ -2086,11 +2154,11 @@ shade_detection_modes = {
 shade_detector_report = {
     "modes": shade_detection_modes,
     "coarse_scan_ml_detector": {
-        "mlp": compute_binary_metrics(y_true_mlp, y_score_mlp, mlp_cal["shade_threshold"]),
-        "cnn": compute_binary_metrics(y_true_cnn, y_score_cnn, cnn_cal["shade_threshold"]),
+        "mlp": compute_shade_detector_metrics(y_true_mlp, y_score_mlp, mlp_cal["shade_threshold"]),
+        "cnn": compute_shade_detector_metrics(y_true_cnn, y_score_cnn, cnn_cal["shade_threshold"]),
     },
     "local_track_escalation_detector": {
-        "mode": shade_detection_modes["local_track_detector_mode"],
+        "mode": shade_detection_modes["local_track_escalation_detector_mode"],
         "mlp_route_metrics": local_metrics_mlp,
         "cnn_route_metrics": local_metrics_cnn,
         "metrics_by_center_region": {
@@ -2102,7 +2170,7 @@ shade_detector_report = {
 print("\n=== 9B) shade detector report ===")
 print(shade_detector_report)
 local_escalation_detector_report = {
-    "task": "local_quick_shade_escalation_detector",
+    "task": "local_track_escalation_detector",
     "thresholds": {"mlp": local_eval_threshold_mlp, "cnn": local_eval_threshold_cnn},
     "mlp_route_metrics": local_metrics_mlp,
     "cnn_route_metrics": local_metrics_cnn,
@@ -2227,10 +2295,13 @@ coarse_metrics_pref = shade_detector_report["coarse_scan_ml_detector"]["mlp" if 
 local_metrics_pref = shade_detector_report["local_track_escalation_detector"]["mlp_route_metrics" if preferred_model == "hybrid_mlp" else "cnn_route_metrics"]
 coarse_scan_false_trigger_rate_non_shaded = float(coarse_metrics_pref["false_trigger_rate_non_shaded"])
 coarse_scan_shaded_recall = float(coarse_metrics_pref["recall"])
-local_track_false_trigger_rate_non_shaded = float(local_metrics_pref["false_trigger_rate_non_shaded"])
-local_track_escalation_recall = float(local_metrics_pref["recall"])
+local_track_false_trigger_rate_non_escalation = float(local_metrics_pref["false_trigger_rate_non_escalation"])
+local_track_escalation_recall = float(local_metrics_pref["escalation_recall"])
 coarse_scan_gate = bool((coarse_scan_false_trigger_rate_non_shaded <= 0.10) and (coarse_scan_shaded_recall >= 0.80))
-local_track_gate = bool((local_track_false_trigger_rate_non_shaded <= 0.10) and (local_track_escalation_recall >= 0.75))
+local_track_gate = bool(
+    (local_track_false_trigger_rate_non_escalation <= cfg.local_track_false_escalation_threshold)
+    and (local_track_escalation_recall >= cfg.local_track_escalation_recall_threshold)
+)
 
 research_recommended = bool(
     beats_det
@@ -2256,8 +2327,10 @@ strict_gates = {
     "compute_feasible": bool(compute_feasible),
     "coarse_scan_false_trigger_rate_non_shaded": coarse_scan_false_trigger_rate_non_shaded,
     "coarse_scan_shaded_recall": coarse_scan_shaded_recall,
-    "local_track_false_trigger_rate_non_shaded": local_track_false_trigger_rate_non_shaded,
+    "local_track_false_trigger_rate_non_escalation": local_track_false_trigger_rate_non_escalation,
     "local_track_escalation_recall": local_track_escalation_recall,
+    "local_track_false_escalation_threshold": float(cfg.local_track_false_escalation_threshold),
+    "local_track_escalation_recall_threshold": float(cfg.local_track_escalation_recall_threshold),
     "coarse_scan_detector_gate": bool(coarse_scan_gate),
     "local_track_detector_gate": bool(local_track_gate),
     "static_efficiency_gate": static_efficiency_gate,
@@ -2288,6 +2361,7 @@ final_recommendation = {
     # PATCH 5: explicit audit labels for candidate/local detector modes.
     "candidate_mode": "deterministic_from_vhat_and_coarse_best",
     "candidate_confidence_mode": "deterministic_score_not_model_predicted",
+    "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
     "strict_gate_status": strict_gates,
@@ -2295,7 +2369,7 @@ final_recommendation = {
     "pilot_ready": bool(pilot_ready),
     "industry_ready": bool(industry_ready),
     "deployable": deployable,
-    "note": "Deterministic fallback remains final authority; dynamic/static standards gates are proxy_only until IEC/EN+HIL validation.",
+    "note": "ML predicts Vmpp prior + uncertainty only; candidate set construction/scoring remains deterministic; deterministic fallback remains final authority; dynamic/static standards gates are proxy_only until IEC/EN+HIL validation.",
 }
 if final_recommendation["local_escalation_detector_mode"] == "deterministic_heuristic":
     final_recommendation["readiness_summary"] = (
@@ -2329,15 +2403,15 @@ print({
         "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
         "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
     },
-    "local_shade_trigger_threshold_calibration": {
+    "local_escalation_trigger_threshold_calibration": {
         "mlp": {
             k: mlp_cal[k]
             for k in [
-                "local_shade_trigger_threshold",
-                "local_shade_precision",
-                "local_shade_recall",
-                "local_shade_f1",
-                "local_shade_bal_acc",
+                "local_escalation_trigger_threshold",
+                "local_escalation_precision",
+                "local_escalation_recall",
+                "local_escalation_f1",
+                "local_escalation_bal_acc",
                 "local_trigger_calibration_mode",
             ]
             if k in mlp_cal
@@ -2345,11 +2419,11 @@ print({
         "cnn": {
             k: cnn_cal[k]
             for k in [
-                "local_shade_trigger_threshold",
-                "local_shade_precision",
-                "local_shade_recall",
-                "local_shade_f1",
-                "local_shade_bal_acc",
+                "local_escalation_trigger_threshold",
+                "local_escalation_precision",
+                "local_escalation_recall",
+                "local_escalation_f1",
+                "local_escalation_bal_acc",
                 "local_trigger_calibration_mode",
             ]
             if k in cnn_cal
@@ -2358,11 +2432,12 @@ print({
     "micro_local_escalation_detector": {
         "micro_ml_detector_trained": bool(mlp_cal.get("micro_ml_detector_trained", False)),
         "micro_ml_detector_param_count": int(mlp_cal.get("micro_ml_detector_param_count", 0)),
-        "micro_shade_threshold": float(mlp_cal.get("micro_shade_threshold", np.nan)),
-        "micro_shade_precision": float(mlp_cal.get("micro_shade_precision", np.nan)),
-        "micro_shade_recall": float(mlp_cal.get("micro_shade_recall", np.nan)),
-        "micro_shade_f1": float(mlp_cal.get("micro_shade_f1", np.nan)),
-        "micro_shade_bal_acc": float(mlp_cal.get("micro_shade_bal_acc", np.nan)),
+        "micro_escalation_threshold": float(mlp_cal.get("micro_escalation_threshold", np.nan)),
+        "micro_escalation_precision": float(mlp_cal.get("micro_escalation_precision", np.nan)),
+        "micro_escalation_recall": float(mlp_cal.get("micro_escalation_recall", np.nan)),
+        "micro_escalation_f1": float(mlp_cal.get("micro_escalation_f1", np.nan)),
+        "micro_escalation_bal_acc": float(mlp_cal.get("micro_escalation_bal_acc", np.nan)),
+        "micro_feature_runtime_safe": True,
     },
     "micro_local_detector": {  # backward-compatible alias
         "micro_ml_detector_trained": bool(mlp_cal.get("micro_ml_detector_trained", False)),
@@ -2501,8 +2576,10 @@ final_recommendation["strict_gate_status"] = {
     "compute_feasible": bool(final_recommendation["compute_feasible"]),
     "coarse_scan_false_trigger_rate_non_shaded": coarse_scan_false_trigger_rate_non_shaded,
     "coarse_scan_shaded_recall": coarse_scan_shaded_recall,
-    "local_track_false_trigger_rate_non_shaded": local_track_false_trigger_rate_non_shaded,
+    "local_track_false_trigger_rate_non_escalation": local_track_false_trigger_rate_non_escalation,
     "local_track_escalation_recall": local_track_escalation_recall,
+    "local_track_false_escalation_threshold": float(cfg.local_track_false_escalation_threshold),
+    "local_track_escalation_recall_threshold": float(cfg.local_track_escalation_recall_threshold),
     "coarse_scan_detector_gate": bool(coarse_scan_gate),
     "local_track_detector_gate": bool(local_track_gate),
     "pilot_ready": bool(pilot_ready),
@@ -2518,9 +2595,11 @@ print(final_recommendation)
 # ===== MODIFIED SECTION (PATCH 4): explicit final architecture status =====
 architecture_status = {
     "coarse_scan_ml_detector": True,
-    "local_track_quick_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
+    "local_track_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
+    "local_track_quick_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
     "candidate_generation_mode": "deterministic_from_vhat_and_coarse_best",
     "candidate_score_mode": "deterministic_score_not_model_predicted",
+    "candidate_scores_are_model_predicted": False,
     "deterministic_fallback_final_authority": True,
 }
 standards_validation_status = {
@@ -2553,6 +2632,7 @@ print("\n=== I) controller audit modes ===")
 print({
     "candidate_mode": "deterministic_from_vhat_and_coarse_best",
     "candidate_confidence_mode": "deterministic_score_not_model_predicted",
+    "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "shade_detection_modes": shade_detection_modes,
 })
@@ -2585,15 +2665,15 @@ if SAVE_MODEL_BUNDLE:
             "mlp": {k: mlp_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
             "cnn": {k: cnn_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
         },
-        "local_shade_trigger_threshold_calibration": {
+        "local_escalation_trigger_threshold_calibration": {
             "mlp": {
                 k: mlp_cal[k]
                 for k in [
-                    "local_shade_trigger_threshold",
-                    "local_shade_precision",
-                    "local_shade_recall",
-                    "local_shade_f1",
-                    "local_shade_bal_acc",
+                    "local_escalation_trigger_threshold",
+                    "local_escalation_precision",
+                    "local_escalation_recall",
+                    "local_escalation_f1",
+                    "local_escalation_bal_acc",
                     "local_trigger_calibration_mode",
                 ]
                 if k in mlp_cal
@@ -2601,11 +2681,11 @@ if SAVE_MODEL_BUNDLE:
             "cnn": {
                 k: cnn_cal[k]
                 for k in [
-                    "local_shade_trigger_threshold",
-                    "local_shade_precision",
-                    "local_shade_recall",
-                    "local_shade_f1",
-                    "local_shade_bal_acc",
+                    "local_escalation_trigger_threshold",
+                    "local_escalation_precision",
+                    "local_escalation_recall",
+                    "local_escalation_f1",
+                    "local_escalation_bal_acc",
                     "local_trigger_calibration_mode",
                 ]
                 if k in cnn_cal
@@ -2614,11 +2694,12 @@ if SAVE_MODEL_BUNDLE:
         "micro_local_escalation_detector": {
             "micro_ml_detector_trained": bool(micro_detector_trained),
             "micro_ml_detector_param_count": int(micro_detector_param_count),
-            "micro_shade_threshold": float(mlp_cal.get("micro_shade_threshold", np.nan)),
-            "micro_shade_precision": float(mlp_cal.get("micro_shade_precision", np.nan)),
-            "micro_shade_recall": float(mlp_cal.get("micro_shade_recall", np.nan)),
-            "micro_shade_f1": float(mlp_cal.get("micro_shade_f1", np.nan)),
-            "micro_shade_bal_acc": float(mlp_cal.get("micro_shade_bal_acc", np.nan)),
+            "micro_escalation_threshold": float(mlp_cal.get("micro_escalation_threshold", np.nan)),
+            "micro_escalation_precision": float(mlp_cal.get("micro_escalation_precision", np.nan)),
+            "micro_escalation_recall": float(mlp_cal.get("micro_escalation_recall", np.nan)),
+            "micro_escalation_f1": float(mlp_cal.get("micro_escalation_f1", np.nan)),
+            "micro_escalation_bal_acc": float(mlp_cal.get("micro_escalation_bal_acc", np.nan)),
+            "micro_feature_runtime_safe": True,
             "micro_feature_names": micro_train_ds["feature_names"],
             "micro_standardizer": micro_detector["standardizer"] if isinstance(micro_detector, dict) else None,
             "micro_model_state": micro_detector_state,
