@@ -104,8 +104,8 @@ class Config:
     micro_label_teacher_mode: str = "oracle_dense_gmpp"
     local_trigger_center_grid: Tuple[float, ...] = (0.55, 0.65, 0.75, 0.85)
     local_trigger_rollout_steps: int = 2
-    local_runtime_rollout_start_fracs: Tuple[float, ...] = (0.62, 0.72, 0.82)
-    micro_escalate_ratio_threshold: float = 1.01
+    local_runtime_rollout_start_fracs: Tuple[float, ...] = (0.35, 0.50, 0.62, 0.72, 0.82)
+    micro_escalate_ratio_threshold: float = 1.002
     local_track_false_escalation_threshold: float = 0.10
     local_track_escalation_recall_threshold: float = 0.75
     micro_pretrain_epochs: int = 35
@@ -1455,7 +1455,7 @@ def microscan_shade_heuristic_score(
     return float(np.clip(score, 0.0, 1.0))
 
 
-def sample_local_track_centers(oracle: "CurveOracle", cfg: Config) -> List[float]:
+def sample_local_track_centers(oracle: "CurveOracle", cfg: Config, row_meta: Optional[Dict] = None) -> List[float]:
     """Sample LOCAL_TRACK centers from short runtime-like rollouts."""
     if oracle.voc <= 0:
         return []
@@ -1468,19 +1468,34 @@ def sample_local_track_centers(oracle: "CurveOracle", cfg: Config) -> List[float
         for _ in range(max(int(cfg.local_trigger_rollout_steps), 0)):
             rollout_v, _rollout_p, _ = refine_local(oracle, rollout_v, cfg)
             centers.append(float(np.clip(rollout_v, cmin, cmax)))
+    # harder sampled centers:
+    # 1) one extra low-voltage probe near 0.25-0.40 Voc, emphasized for shaded curves
+    # 2) one probe offset from coarse-best when dense curve appears multi-peak
+    shade_flag = int((row_meta or {}).get("y_shade", 0))
+    low_probe_frac = 0.30 if shade_flag == 1 else 0.38
+    centers.append(float(np.clip(low_probe_frac * oracle.voc, cmin, cmax)))
+    dense_peak_count = int((row_meta or {}).get("dense_peak_count", 0))
+    if dense_peak_count >= 2:
+        coarse_best_v = float((row_meta or {}).get("coarse_best_v", np.nan))
+        if np.isfinite(coarse_best_v):
+            coarse_probe = coarse_best_v + 0.08 * oracle.voc
+        else:
+            coarse_probe = 0.78 * oracle.voc
+        centers.append(float(np.clip(coarse_probe, cmin, cmax)))
     return [float(c) for c in centers]
 
 
-def collect_local_track_runtime_states(rows: List[Dict], cfg: Config) -> List[Dict]:
+def collect_local_track_runtime_states(rows: List[Dict], cfg: Config, ratio_threshold: Optional[float] = None) -> List[Dict]:
     """PATCH 1: runtime-faithful LOCAL_TRACK state sampler with strong offline escalation teacher."""
     states = []
     teacher_mode = str(getattr(cfg, "micro_label_teacher_mode", "oracle_dense_gmpp"))
+    threshold_used = float(cfg.micro_escalate_ratio_threshold if ratio_threshold is None else ratio_threshold)
     for r in rows:
         oracle = CurveOracle(r["v_curve"], r["i_curve"])
         p_global_teacher = float(oracle.pmpp_true) if teacher_mode == "oracle_dense_gmpp" else float(run_deterministic_baseline(oracle, cfg)["final_P_best"])
-        for center_v in sample_local_track_centers(oracle, cfg):
+        for center_v in sample_local_track_centers(oracle, cfg, row_meta=r):
             _local_v, p_local, _ = refine_local(oracle, float(center_v), cfg)
-            y_escalate = int(p_global_teacher >= cfg.micro_escalate_ratio_threshold * max(float(p_local), 1e-9))
+            y_escalate = int(p_global_teacher >= threshold_used * max(float(p_local), 1e-9))
             states.append({
                 "oracle": oracle,
                 "center_v": float(center_v),
@@ -1489,6 +1504,7 @@ def collect_local_track_runtime_states(rows: List[Dict], cfg: Config) -> List[Di
                 "p_local": float(p_local),
                 "p_global_teacher": float(p_global_teacher),
                 "micro_label_teacher_mode": teacher_mode,
+                "micro_escalate_ratio_threshold_used": float(threshold_used),
                 "center_norm": float(center_v / max(oracle.voc, 1e-9)),
             })
     return states
@@ -2309,10 +2325,32 @@ mlp_shade_cal = calibrate_shade_threshold(mlp, exp_cal_arrays, cfg)
 cnn_shade_cal = calibrate_shade_threshold(cnn, exp_cal_arrays, cfg)
 # ===== MODIFIED SECTION (PATCH 2/3): micro local escalation detector uses sim->exp staged runtime-state training =====
 sim_micro_rows = sim_ok_rows + sim_sh_rows
-micro_states_sim_train = collect_local_track_runtime_states(sim_micro_rows, cfg)
-micro_states_exp_train = collect_local_track_runtime_states(exp_ft_rows, cfg)
-micro_states_exp_cal = collect_local_track_runtime_states(exp_cal_rows, cfg)
-micro_states_exp_test = collect_local_track_runtime_states(exp_test_rows, cfg)
+micro_escalate_ratio_threshold_used = float(cfg.micro_escalate_ratio_threshold)
+micro_relaxed_relabel_used = False
+
+micro_states_sim_train = collect_local_track_runtime_states(sim_micro_rows, cfg, ratio_threshold=micro_escalate_ratio_threshold_used)
+micro_states_exp_train = collect_local_track_runtime_states(exp_ft_rows, cfg, ratio_threshold=micro_escalate_ratio_threshold_used)
+micro_states_exp_cal = collect_local_track_runtime_states(exp_cal_rows, cfg, ratio_threshold=micro_escalate_ratio_threshold_used)
+micro_states_exp_test = collect_local_track_runtime_states(exp_test_rows, cfg, ratio_threshold=micro_escalate_ratio_threshold_used)
+
+n_total_train = int(len(micro_states_exp_train))
+n_positive_train = int(sum(int(st.get("y_escalate", 0)) for st in micro_states_exp_train))
+positive_rate_train = float(n_positive_train / max(n_total_train, 1))
+if n_positive_train == 0 or positive_rate_train < 0.02:
+    micro_relaxed_relabel_used = True
+    micro_escalate_ratio_threshold_used = 1.0005
+    print("\n[local-track labels] triggering relaxed relabeling due to sparse positives in train split.")
+    print({
+        "n_total_train": n_total_train,
+        "n_positive_train": n_positive_train,
+        "positive_rate_train": positive_rate_train,
+        "relaxed_threshold": micro_escalate_ratio_threshold_used,
+    })
+    micro_states_sim_train = collect_local_track_runtime_states(sim_micro_rows, cfg, ratio_threshold=micro_escalate_ratio_threshold_used)
+    micro_states_exp_train = collect_local_track_runtime_states(exp_ft_rows, cfg, ratio_threshold=micro_escalate_ratio_threshold_used)
+    micro_states_exp_cal = collect_local_track_runtime_states(exp_cal_rows, cfg, ratio_threshold=micro_escalate_ratio_threshold_used)
+    micro_states_exp_test = collect_local_track_runtime_states(exp_test_rows, cfg, ratio_threshold=micro_escalate_ratio_threshold_used)
+
 micro_train_ds_sim = build_micro_scan_dataset_from_states(micro_states_sim_train, cfg)
 micro_train_ds = build_micro_scan_dataset_from_states(micro_states_exp_train, cfg)
 micro_cal_ds = build_micro_scan_dataset_from_states(micro_states_exp_cal, cfg)
@@ -2331,6 +2369,8 @@ def summarize_center_distribution(center_norm: np.ndarray) -> Dict[str, float]:
 
 local_runtime_state_summary = {
     "micro_label_teacher_mode": str(cfg.micro_label_teacher_mode),
+    "micro_escalate_ratio_threshold_used": float(micro_escalate_ratio_threshold_used),
+    "micro_relaxed_relabel_used": bool(micro_relaxed_relabel_used),
     "micro_runtime_state_count_train": int(len(micro_train_ds["x"])),
     "micro_runtime_state_count_cal": int(len(micro_cal_ds["x"])),
     "micro_runtime_state_count_test": int(len(micro_test_ds["x"])),
@@ -2349,6 +2389,9 @@ local_state_positive_rate_summary = {
     "train": local_positive_rate_summaries(micro_states_exp_train, "train"),
     "cal": local_positive_rate_summaries(micro_states_exp_cal, "cal"),
     "test": local_positive_rate_summaries(micro_states_exp_test, "test"),
+    "micro_label_teacher_mode": str(cfg.micro_label_teacher_mode),
+    "micro_escalate_ratio_threshold_used": float(micro_escalate_ratio_threshold_used),
+    "micro_relaxed_relabel_used": bool(micro_relaxed_relabel_used),
     "positive_rate_by_model_split": {
         "train": float(local_state_label_counts["train"]["positive_rate"]),
         "cal": float(local_state_label_counts["cal"]["positive_rate"]),
@@ -2357,20 +2400,32 @@ local_state_positive_rate_summary = {
 }
 local_label_audit_sample = pd.DataFrame([{
     "center_v": float(st.get("center_v", np.nan)),
+    "center_norm": float(st.get("center_norm", np.nan)),
     "P_local": float(st.get("p_local", np.nan)),
-    "P_global_best": float(st.get("p_global_teacher", np.nan)),
-    "micro_escalate_ratio_threshold": float(cfg.micro_escalate_ratio_threshold),
+    "P_global_teacher": float(st.get("p_global_teacher", np.nan)),
+    "gain_ratio": float(st.get("p_global_teacher", np.nan) / max(float(st.get("p_local", np.nan)), 1e-9)),
+    "micro_escalate_ratio_threshold_used": float(micro_escalate_ratio_threshold_used),
     "y_escalate": int(st.get("y_escalate", 0)),
     "y_shade": int(st.get("y_shade", 0)),
-} for st in micro_states_exp_test[:20]])
+} for st in micro_states_exp_train[:20]])
+micro_positive_rate_snapshot = {
+    "micro_label_teacher_mode": str(cfg.micro_label_teacher_mode),
+    "micro_escalate_ratio_threshold_used": float(micro_escalate_ratio_threshold_used),
+    "micro_escalate_positive_rate_train": float(local_state_label_counts["train"]["positive_rate"]),
+    "micro_escalate_positive_rate_cal": float(local_state_label_counts["cal"]["positive_rate"]),
+    "micro_escalate_positive_rate_test": float(local_state_label_counts["test"]["positive_rate"]),
+    "micro_relaxed_relabel_used": bool(micro_relaxed_relabel_used),
+}
 print("\n=== 5A.1) local escalation label counts by split ===")
 print(local_state_label_counts)
 print("\n=== 5A.2) local escalation positive-rate summaries ===")
 print(local_state_positive_rate_summary)
-print("\n=== 5A.3) local escalation label audit sample (test runtime states) ===")
+print("\n=== 5A.3) local escalation rates + threshold snapshot ===")
+print(micro_positive_rate_snapshot)
+print("\n=== 5A.4) local escalation label audit sample (train runtime states, first 20) ===")
 print(local_label_audit_sample)
 if local_state_label_counts["train"]["n_positive_escalation"] == 0:
-    raise RuntimeError("local escalation label collapse: zero positives in train split; adjust runtime-state generation/threshold.")
+    raise RuntimeError("local escalation label collapse: zero positives in train split even after relaxed relabeling; adjust runtime-state generation.")
 micro_detector_trained = False
 micro_detector_param_count = 0
 micro_detector = None
