@@ -81,6 +81,17 @@ class Config:
     low_conf_widen_threshold: float = 0.35
     nonshaded_no_harm_tolerance: float = 0.002
     candidate_conf_threshold: float = 0.55
+    learned_candidate_conf_threshold: float = 0.55
+    num_candidates: int = 2
+    peak_prominence_ratio: float = 0.06
+    peak_min_separation_ratio: float = 0.08
+    candidate_secondary_power_floor_ratio: float = 0.25
+    lambda_unc: float = 1.0
+    lambda_shade: float = 0.35
+    lambda_cand_v: float = 0.75
+    lambda_cand_rank: float = 0.35
+    lambda_cand_valid: float = 0.20
+    use_emergency_deterministic_candidate_backup: bool = False
     relaxed_compute_latency_threshold_sec: float = 0.005
     preferred_compute_latency_threshold_sec: float = 0.001
     static_efficiency_threshold: float = 0.99
@@ -342,6 +353,93 @@ def count_local_maxima(arr: np.ndarray, noise_tolerance: float = 0.02) -> int:
     return c
 
 
+def extract_candidate_targets_from_dense_curve(v: np.ndarray, i: np.ndarray, cfg: Config) -> Dict[str, np.ndarray]:
+    """PATCH BLOCK A: supervised 2-slot candidate targets from dense P-V curve."""
+    voc = float(np.max(v)) if len(v) else 0.0
+    if voc <= 0:
+        zeros = np.zeros((cfg.num_candidates,), dtype=np.float32)
+        return {
+            "y_cand_v": zeros.copy(),
+            "y_cand_valid": zeros.copy(),
+            "y_cand_rank_target": zeros.copy(),
+            "y_num_candidates": np.int64(0),
+        }
+    vd = np.linspace(0.0, voc, 600)
+    idense = np.maximum(np.interp(vd, v, i), 0.0)
+    pd = vd * idense
+    pmax = float(np.max(pd)) if len(pd) else 0.0
+    if pmax <= 0:
+        zeros = np.zeros((cfg.num_candidates,), dtype=np.float32)
+        return {
+            "y_cand_v": zeros.copy(),
+            "y_cand_valid": zeros.copy(),
+            "y_cand_rank_target": zeros.copy(),
+            "y_num_candidates": np.int64(0),
+        }
+
+    peak_items = []
+    min_prom = float(cfg.peak_prominence_ratio * pmax)
+    min_sep_v = float(cfg.peak_min_separation_ratio * voc)
+    for k in range(1, len(pd) - 1):
+        pk = float(pd[k])
+        if not (pk > pd[k - 1] and pk >= pd[k + 1]):
+            continue
+        left = float(np.min(pd[max(0, k - 6):k + 1]))
+        right = float(np.min(pd[k:min(len(pd), k + 7)]))
+        prominence = pk - max(left, right)
+        if prominence < min_prom:
+            continue
+        if pk < float(cfg.candidate_secondary_power_floor_ratio * pmax):
+            continue
+        peak_items.append((float(vd[k]), pk))
+
+    # keep strongest peaks while enforcing min voltage separation
+    peak_items = sorted(peak_items, key=lambda t: t[1], reverse=True)
+    selected = []
+    for vv, pp in peak_items:
+        if all(abs(vv - sv) >= min_sep_v for sv, _ in selected):
+            selected.append((vv, pp))
+        if len(selected) >= max(cfg.num_candidates, 4):
+            break
+    selected = sorted(selected, key=lambda t: t[1], reverse=True)
+
+    gmpp_idx = int(np.argmax(pd))
+    gmpp_v = float(vd[gmpp_idx])
+    gmpp_p = float(pd[gmpp_idx])
+    secondary = None
+    for vv, pp in selected:
+        if abs(vv - gmpp_v) >= min_sep_v and pp >= float(cfg.candidate_secondary_power_floor_ratio * gmpp_p):
+            secondary = (vv, pp)
+            break
+
+    y_cand_v = np.zeros((cfg.num_candidates,), dtype=np.float32)
+    y_cand_valid = np.zeros((cfg.num_candidates,), dtype=np.float32)
+    y_cand_rank_target = np.zeros((cfg.num_candidates,), dtype=np.float32)
+    y_cand_v[0] = np.float32(np.clip(gmpp_v / max(voc, 1e-9), 0.0, 1.0))
+    y_cand_valid[0] = 1.0
+    y_cand_rank_target[0] = 1.0
+    if cfg.num_candidates > 1:
+        if secondary is not None:
+            y_cand_v[1] = np.float32(np.clip(secondary[0] / max(voc, 1e-9), 0.0, 1.0))
+            y_cand_valid[1] = 1.0
+            y_cand_rank_target[1] = np.float32(np.clip(secondary[1] / max(gmpp_p, 1e-9), 0.0, 1.0))
+            y_num_candidates = 2
+        else:
+            y_cand_v[1] = y_cand_v[0]
+            y_cand_valid[1] = 0.0
+            y_cand_rank_target[1] = 0.0
+            y_num_candidates = 1
+    else:
+        y_num_candidates = 1
+
+    return {
+        "y_cand_v": y_cand_v.astype(np.float32),
+        "y_cand_valid": y_cand_valid.astype(np.float32),
+        "y_cand_rank_target": y_cand_rank_target.astype(np.float32),
+        "y_num_candidates": np.int64(y_num_candidates),
+    }
+
+
 # -------------------------
 # SHARED FEATURE EXTRACTION (scalar + sequence + metadata)
 # -------------------------
@@ -370,6 +468,7 @@ def extract_sparse_features(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarr
     dense_i = np.maximum(np.interp(dense_v, v, i), 0.0)
     dense_p = dense_v * dense_i
     dense_peak_count = count_local_maxima(dense_p, noise_tolerance=0.01)
+    cand_targets = extract_candidate_targets_from_dense_curve(v, i, cfg)
 
     return {
         "scalar": scalar,
@@ -385,6 +484,10 @@ def extract_sparse_features(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarr
         "coarse_best_p": np.float32(coarse_best_p),
         "coarse_multipeak": np.int64(coarse_multipeak),
         "dense_peak_count": np.int64(dense_peak_count),
+        "y_cand_v": cand_targets["y_cand_v"],
+        "y_cand_valid": cand_targets["y_cand_valid"],
+        "y_cand_rank_target": cand_targets["y_cand_rank_target"],
+        "y_num_candidates": cand_targets["y_num_candidates"],
     }
 
 
@@ -440,7 +543,7 @@ def apply_standardizer(flat: np.ndarray, scalar: np.ndarray, seq: np.ndarray, st
 # NEW CLASSES ADDED
 # -------------------------
 class MultiTaskMLP(nn.Module):
-    """PATCH 1 (Option B): tiny MLP with deterministic candidate generation downstream."""
+    """PATCH BLOCK B: tiny MLP with learned candidate heads."""
 
     def __init__(self, in_dim: int, dropout: float = 0.08):
         super().__init__()
@@ -454,17 +557,23 @@ class MultiTaskMLP(nn.Module):
         self.head_mean = nn.Linear(32, 1)
         self.head_logvar = nn.Linear(32, 1)
         self.head_shade = nn.Linear(32, 1)
+        self.candidate_voltage_head = nn.Linear(32, cfg.num_candidates)
+        self.candidate_logit_head = nn.Linear(32, cfg.num_candidates)
+        self.candidate_valid_head = nn.Linear(32, cfg.num_candidates)
 
     def forward(self, x_flat, _x_scalar=None, _x_seq=None):
         h = self.backbone(x_flat)
         mean = torch.sigmoid(self.head_mean(h)).squeeze(-1)
         logvar = self.head_logvar(h).squeeze(-1)
         shade_logit = self.head_shade(h).squeeze(-1)
-        return mean, logvar, shade_logit
+        cand_v = torch.sigmoid(self.candidate_voltage_head(h))
+        cand_rank_logits = self.candidate_logit_head(h)
+        cand_valid_logits = self.candidate_valid_head(h)
+        return mean, logvar, shade_logit, cand_v, cand_rank_logits, cand_valid_logits
 
 
 class TinyHybridCNN(nn.Module):
-    """PATCH 1 (Option B): tiny 1D-CNN with deterministic candidate generation downstream."""
+    """PATCH BLOCK B: tiny 1D-CNN with learned candidate heads."""
 
     def __init__(self, scalar_dim: int = 3):
         super().__init__()
@@ -485,6 +594,9 @@ class TinyHybridCNN(nn.Module):
         self.head_mean = nn.Linear(32, 1)
         self.head_logvar = nn.Linear(32, 1)
         self.head_shade = nn.Linear(32, 1)
+        self.candidate_voltage_head = nn.Linear(32, cfg.num_candidates)
+        self.candidate_logit_head = nn.Linear(32, cfg.num_candidates)
+        self.candidate_valid_head = nn.Linear(32, cfg.num_candidates)
 
     def forward(self, _x_flat, x_scalar, x_seq):
         hs = self.seq_branch(x_seq).flatten(1)
@@ -493,7 +605,10 @@ class TinyHybridCNN(nn.Module):
         mean = torch.sigmoid(self.head_mean(h)).squeeze(-1)
         logvar = self.head_logvar(h).squeeze(-1)
         shade_logit = self.head_shade(h).squeeze(-1)
-        return mean, logvar, shade_logit
+        cand_v = torch.sigmoid(self.candidate_voltage_head(h))
+        cand_rank_logits = self.candidate_logit_head(h)
+        cand_valid_logits = self.candidate_valid_head(h)
+        return mean, logvar, shade_logit, cand_v, cand_rank_logits, cand_valid_logits
 
 
 class MicroShadeMLP(nn.Module):
@@ -590,8 +705,8 @@ def hetero_regression_loss(y, mu, logvar):
 
 
 def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: str):
-    x_flat_tr, x_scalar_tr, x_seq_tr, yv_tr, ys_tr = train_arrays
-    x_flat_va, x_scalar_va, x_seq_va, yv_va, ys_va = val_arrays
+    x_flat_tr, x_scalar_tr, x_seq_tr, yv_tr, ys_tr, ycv_tr, ycvd_tr, ycr_tr = train_arrays
+    x_flat_va, x_scalar_va, x_seq_va, yv_va, ys_va, ycv_va, ycvd_va, ycr_va = val_arrays
 
     epochs = cfg.pretrain_epochs if stage == "pretrain" else cfg.finetune_epochs
     lr = cfg.lr_pretrain if stage == "pretrain" else cfg.lr_finetune
@@ -616,11 +731,26 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
             yb = torch.tensor(yv_aug[b], device=cfg.device)
             sb = torch.tensor(ys_aug[b], device=cfg.device)
 
-            mu, logvar, slogit = model(xb, xs, xq)
-            reg = hetero_regression_loss(yb, mu, logvar).mean()
+            ycv = torch.tensor(ycv_tr[b], device=cfg.device)
+            ycvd = torch.tensor(ycvd_tr[b], device=cfg.device)
+            ycr = torch.tensor(ycr_tr[b], device=cfg.device)
+            mu, logvar, slogit, cand_v, cand_rank_logits, cand_valid_logits = model(xb, xs, xq)
+            main_vmpp_loss = hetero_regression_loss(yb, mu, logvar).mean()
+            unc_loss = torch.zeros((), device=cfg.device)
             cls = F.binary_cross_entropy_with_logits(slogit, sb)
+            cand_v_loss = (((cand_v - ycv) ** 2) * ycvd).sum() / torch.clamp(ycvd.sum(), min=1.0)
+            cand_rank_loss = F.binary_cross_entropy_with_logits(cand_rank_logits, ycr)
+            cand_valid_loss = F.binary_cross_entropy_with_logits(cand_valid_logits, ycvd)
             l2 = sum((p ** 2).sum() for p in model.parameters())
-            loss = reg + cfg.shade_bce_weight * cls + cfg.reg_l2_weight * l2
+            loss = (
+                main_vmpp_loss
+                + cfg.lambda_unc * unc_loss
+                + cfg.lambda_shade * cls
+                + cfg.lambda_cand_v * cand_v_loss
+                + cfg.lambda_cand_rank * cand_rank_loss
+                + cfg.lambda_cand_valid * cand_valid_loss
+                + cfg.reg_l2_weight * l2
+            )
 
             opt.zero_grad()
             loss.backward()
@@ -633,10 +763,22 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
             xq = torch.tensor(x_seq_va, device=cfg.device)
             yb = torch.tensor(yv_va, device=cfg.device)
             sb = torch.tensor(ys_va, device=cfg.device)
-            mu, logvar, slogit = model(xb, xs, xq)
-            reg = hetero_regression_loss(yb, mu, logvar).mean()
+            ycv = torch.tensor(ycv_va, device=cfg.device)
+            ycvd = torch.tensor(ycvd_va, device=cfg.device)
+            ycr = torch.tensor(ycr_va, device=cfg.device)
+            mu, logvar, slogit, cand_v, cand_rank_logits, cand_valid_logits = model(xb, xs, xq)
+            main_vmpp_loss = hetero_regression_loss(yb, mu, logvar).mean()
             cls = F.binary_cross_entropy_with_logits(slogit, sb)
-            vloss = float((reg + cfg.shade_bce_weight * cls).cpu())
+            cand_v_loss = (((cand_v - ycv) ** 2) * ycvd).sum() / torch.clamp(ycvd.sum(), min=1.0)
+            cand_rank_loss = F.binary_cross_entropy_with_logits(cand_rank_logits, ycr)
+            cand_valid_loss = F.binary_cross_entropy_with_logits(cand_valid_logits, ycvd)
+            vloss = float((
+                main_vmpp_loss
+                + cfg.lambda_shade * cls
+                + cfg.lambda_cand_v * cand_v_loss
+                + cfg.lambda_cand_rank * cand_rank_loss
+                + cfg.lambda_cand_valid * cand_valid_loss
+            ).cpu())
 
         print(f"[{stage}] epoch {ep:03d} val_loss={vloss:.5f}")
         if vloss < best - 1e-6:
@@ -696,37 +838,40 @@ def model_predict_api(
     calib: Dict[str, float],
     cfg: Config,
 ):
-    """PATCH 2: ML advisory API only (no controller-side measurement calls)."""
+    """PATCH BLOCK B/E: learned candidate API with optional emergency deterministic backup."""
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(flat_n[None, :], dtype=torch.float32, device=cfg.device)
         xs = torch.tensor(scalar_n[None, :], dtype=torch.float32, device=cfg.device)
         xq = torch.tensor(seq_n[None, :, :], dtype=torch.float32, device=cfg.device)
-        mu, logvar, slogit = model(xb, xs, xq)
+        mu, logvar, slogit, cand_v, cand_rank_logits, cand_valid_logits = model(xb, xs, xq)
         raw_sigma = float(torch.exp(0.5 * logvar).cpu().numpy()[0])
         sigma = float(raw_sigma * calib["sigma_scale"])
         shade_prob = float(torch.sigmoid(slogit).cpu().numpy()[0])
+        cand_v_np = np.clip(cand_v.cpu().numpy()[0], cfg.sample_fracs_min, cfg.sample_fracs_max)
+        cand_conf_np = torch.sigmoid(cand_rank_logits).cpu().numpy()[0]
+        cand_valid_np = torch.sigmoid(cand_valid_logits).cpu().numpy()[0]
 
     confidence = float(np.clip(1.0 - sigma / (calib["sigma_threshold"] + 1e-9), 0.0, 1.0))
     shade_threshold = float(calib.get("shade_threshold", cfg.shade_prob_threshold))
     v_center = float(np.clip(mu.cpu().numpy()[0], 0.0, 1.0))
-    v_candidates = np.unique(np.clip(
-        np.array([v_center - 0.08, v_center, 0.5 * (v_center + coarse_best_v_norm), coarse_best_v_norm], dtype=float),
-        cfg.sample_fracs_min,
-        cfg.sample_fracs_max,
-    ))
-    dist_term = 1.0 - np.clip(
-        np.abs(v_candidates - coarse_best_v_norm) / max(cfg.sample_fracs_max - cfg.sample_fracs_min, 1e-9),
-        0.0,
-        1.0,
+    v_candidates = cand_v_np.astype(float)
+    cand_scores_list = np.clip(cand_conf_np, 0.0, 1.0).astype(float).tolist()
+    candidate_valid_probs = np.clip(cand_valid_np, 0.0, 1.0).astype(float).tolist()
+    emergency_candidate_backup_used = False
+    invalid_learned = (
+        len(v_candidates) == 0
+        or np.any(~np.isfinite(v_candidates))
+        or float(np.max(candidate_valid_probs)) < 0.05
     )
-    center_term = 1.0 - np.clip(
-        np.abs(v_candidates - v_center) / max(cfg.sample_fracs_max - cfg.sample_fracs_min, 1e-9),
-        0.0,
-        1.0,
-    )
-    cand_scores = np.clip((0.55 * confidence) + (0.30 * dist_term) + (0.15 * center_term), 0.0, 1.0)
-    cand_scores_list = cand_scores.tolist()
+    if cfg.use_emergency_deterministic_candidate_backup and invalid_learned:
+        emergency_candidate_backup_used = True
+        v_candidates = np.array(
+            [np.clip(v_center, cfg.sample_fracs_min, cfg.sample_fracs_max), np.clip(coarse_best_v_norm, cfg.sample_fracs_min, cfg.sample_fracs_max)],
+            dtype=float,
+        )
+        cand_scores_list = [float(confidence), float(confidence)]
+        candidate_valid_probs = [1.0, 1.0]
     pred = {
         "vhat": v_center,
         "raw_sigma": raw_sigma,
@@ -734,23 +879,27 @@ def model_predict_api(
         "confidence": confidence,
         "shade_prob": shade_prob,
         "shade_flag": int(shade_prob >= shade_threshold),
-        "V_candidates": v_candidates.tolist(),
+        "V_candidates": np.asarray(v_candidates, dtype=float).tolist(),
         "candidate_confidences": cand_scores_list,  # backward-compatible key
         "candidate_scores": cand_scores_list,
+        "candidate_valid_probs": candidate_valid_probs,
         "candidate_disagreement": float(np.std(v_candidates)),
-        "candidate_scores_are_model_predicted": False,
+        "candidate_scores_are_model_predicted": True,
+        "candidate_generation_mode": "learned_multi_candidate",
+        "candidate_score_mode": "model_predicted",
+        "emergency_candidate_backup_used": bool(emergency_candidate_backup_used),
     }
     return pred
 
 
 def calibrate_uncertainty(model, arrays_cal, cfg: Config) -> Dict[str, float]:
-    x_flat, x_scalar, x_seq, yv, _ys = arrays_cal
+    x_flat, x_scalar, x_seq, yv, _ys, _ycv, _ycvd, _ycr = arrays_cal
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, device=cfg.device)
         xs = torch.tensor(x_scalar, device=cfg.device)
         xq = torch.tensor(x_seq, device=cfg.device)
-        mu, logvar, _ = model(xb, xs, xq)
+        mu, logvar, _, _cand_v, _cand_rank_logits, _cand_valid_logits = model(xb, xs, xq)
         mu = mu.cpu().numpy()
         raw_sigma = np.exp(0.5 * logvar.cpu().numpy())
 
@@ -791,13 +940,13 @@ def calibrate_uncertainty(model, arrays_cal, cfg: Config) -> Dict[str, float]:
 
 def calibrate_shade_threshold(model, arrays_cal, cfg: Config) -> Dict[str, float]:
     """PATCH 3: calibration-driven shade threshold selection (safety-oriented)."""
-    x_flat, x_scalar, x_seq, _yv, ys = arrays_cal
+    x_flat, x_scalar, x_seq, _yv, ys, _ycv, _ycvd, _ycr = arrays_cal
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, device=cfg.device)
         xs = torch.tensor(x_scalar, device=cfg.device)
         xq = torch.tensor(x_seq, device=cfg.device)
-        _, _, slogit = model(xb, xs, xq)
+        _, _, slogit, _cand_v, _cand_rank_logits, _cand_valid_logits = model(xb, xs, xq)
         shade_prob = torch.sigmoid(slogit).cpu().numpy()
     ytrue = ys.astype(int)
     best = {"threshold": cfg.shade_prob_threshold, "precision": 0.0, "recall": 0.0, "f1": 0.0, "bal_acc": 0.0}
@@ -898,7 +1047,17 @@ def runtime_candidate_acceptance_from_prediction(
     cfg: Config,
 ) -> Dict[str, float]:
     """PATCH 2: runtime-faithful candidate acceptance checks (excluding score-threshold gate)."""
+    cand_valid_probs = np.asarray(pred.get("candidate_valid_probs", np.ones(len(pred["V_candidates"]))), dtype=float)
     cand_vs = [float(np.clip(vc * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc)) for vc in pred["V_candidates"]]
+    if len(cand_vs) == 0:
+        return {
+            "candidate_accept": 0,
+            "fallback_reason": "invalid_prediction",
+            "best_candidate_post_refine_power": 0.0,
+            "best_candidate_pre_refine_power": 0.0,
+            "best_candidate_index": -1,
+            "best_candidate_voltage": float(coarse_best_v),
+        }
     pre_powers = [float(v * oracle.measure(v)) for v in cand_vs]
     refined = [refine_local(oracle, c, cfg) for c in cand_vs]
     post_powers = [float(r[1]) for r in refined]
@@ -911,6 +1070,8 @@ def runtime_candidate_acceptance_from_prediction(
     fallback_reason = "none"
     if not np.isfinite(best_post):
         fallback_reason = "invalid_prediction"
+    elif np.max(cand_valid_probs) < 0.05:
+        fallback_reason = "all_candidate_valid_probs_too_low"
     elif best_pre < cfg.fallback_sanity_ratio * coarse_best_p:
         fallback_reason = "sanity_worse_than_coarse"
     elif pbest < cfg.verify_ratio_threshold * coarse_best_p:
@@ -934,7 +1095,7 @@ def runtime_candidate_acceptance_from_prediction(
 
 
 def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib: Dict[str, float], cfg: Config) -> Dict[str, float]:
-    """PATCH 2: calibrate candidate score threshold with runtime-aligned acceptance semantics."""
+    """PATCH BLOCK D: calibrate learned candidate confidence threshold with runtime acceptance semantics."""
     score_list = []
     good_list = []
     for r in rows_cal:
@@ -979,6 +1140,7 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
             "candidate_accept_precision": 0.0,
             "candidate_accept_recall": 0.0,
             "candidate_accept_f1": 0.0,
+            "candidate_accept_bal_acc": 0.0,
         }
 
     score_arr = np.asarray(score_list, dtype=float)
@@ -988,27 +1150,33 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
         "precision": 0.0,
         "recall": 0.0,
         "f1": 0.0,
+        "bal_acc": 0.0,
     }
     for th in np.linspace(0.10, 0.95, 35):
         yhat = (score_arr >= th).astype(int)
         tp = int(np.sum((yhat == 1) & (ytrue == 1)))
         fp = int(np.sum((yhat == 1) & (ytrue == 0)))
         fn = int(np.sum((yhat == 0) & (ytrue == 1)))
+        tn = int(np.sum((yhat == 0) & (ytrue == 0)))
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+        tnr = tn / max(tn + fp, 1)
+        bal_acc = 0.5 * (recall + tnr)
         # safety-first objective: maximize precision, then F1, then recall.
-        curr = (precision, f1, recall)
-        prev = (best["precision"], best["f1"], best["recall"])
+        curr = (precision, bal_acc, f1, recall)
+        prev = (best["precision"], best["bal_acc"], best["f1"], best["recall"])
         if curr > prev:
-            best = {"threshold": float(th), "precision": float(precision), "recall": float(recall), "f1": float(f1)}
+            best = {"threshold": float(th), "precision": float(precision), "recall": float(recall), "f1": float(f1), "bal_acc": float(bal_acc)}
 
     return {
         "candidate_conf_threshold_calibrated": best["threshold"],
+        "learned_candidate_conf_threshold": best["threshold"],
         "candidate_accept_precision": best["precision"],
         "candidate_accept_recall": best["recall"],
         "candidate_accept_f1": best["f1"],
-        "candidate_threshold_calibration_mode": "runtime_acceptance_aligned",
+        "candidate_accept_bal_acc": best["bal_acc"],
+        "candidate_threshold_calibration_mode": "runtime_acceptance_aligned_learned",
     }
 
 
@@ -1071,13 +1239,13 @@ def compute_local_escalation_metrics(y_true: np.ndarray, y_score: np.ndarray, th
 
 
 def uncertainty_diagnostics(model, arrays, calib, cfg: Config) -> Dict[str, float]:
-    x_flat, x_scalar, x_seq, yv, _ = arrays
+    x_flat, x_scalar, x_seq, yv, _, _ycv, _ycvd, _ycr = arrays
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, device=cfg.device)
         xs = torch.tensor(x_scalar, device=cfg.device)
         xq = torch.tensor(x_seq, device=cfg.device)
-        mu, logvar, _ = model(xb, xs, xq)
+        mu, logvar, _, _cand_v, _cand_rank_logits, _cand_valid_logits = model(xb, xs, xq)
         mu = mu.cpu().numpy()
         sigma = np.exp(0.5 * logvar.cpu().numpy()) * calib["sigma_scale"]
     err = np.abs(mu - yv)
@@ -1087,6 +1255,47 @@ def uncertainty_diagnostics(model, arrays, calib, cfg: Config) -> Dict[str, floa
         "p95": float(np.quantile(err, 0.95)),
         "p99": float(np.quantile(err, 0.99)),
         "mean_sigma": float(np.mean(sigma)),
+    }
+
+
+def candidate_head_diagnostics(model, arrays, cfg: Config) -> Dict[str, float]:
+    """PATCH BLOCK G: candidate-specific supervised head metrics."""
+    x_flat, x_scalar, x_seq, _yv, _ys, ycv, ycvd, ycr = arrays
+    model.eval()
+    with torch.no_grad():
+        xb = torch.tensor(x_flat, device=cfg.device)
+        xs = torch.tensor(x_scalar, device=cfg.device)
+        xq = torch.tensor(x_seq, device=cfg.device)
+        _mu, _logvar, _slogit, cand_v, cand_rank_logits, cand_valid_logits = model(xb, xs, xq)
+    cand_v = cand_v.cpu().numpy()
+    rank_prob = torch.sigmoid(cand_rank_logits).cpu().numpy()
+    valid_prob = torch.sigmoid(cand_valid_logits).cpu().numpy()
+    slot0_err = np.abs(cand_v[:, 0] - ycv[:, 0])
+    slot1_mask = ycvd[:, 1] > 0.5
+    slot1_err = np.abs(cand_v[slot1_mask, 1] - ycv[slot1_mask, 1]) if np.any(slot1_mask) else np.array([])
+    top_idx = np.argmax(rank_prob, axis=1)
+    top1_hit = np.mean(top_idx == 0) if len(top_idx) else 0.0
+    top2_contains = np.mean(np.any(np.argsort(-rank_prob, axis=1)[:, :2] == 0, axis=1)) if len(rank_prob) else 0.0
+    rank_acc = np.mean((rank_prob[:, 0] >= rank_prob[:, 1]).astype(int) == 1) if len(rank_prob) else 0.0
+    valid_true = ycvd.reshape(-1).astype(int)
+    valid_hat = (valid_prob.reshape(-1) >= 0.5).astype(int)
+    tp = int(np.sum((valid_hat == 1) & (valid_true == 1)))
+    fp = int(np.sum((valid_hat == 1) & (valid_true == 0)))
+    fn = int(np.sum((valid_hat == 0) & (valid_true == 1)))
+    prec = tp / max(tp + fp, 1)
+    rec = tp / max(tp + fn, 1)
+    f1 = 2 * prec * rec / max(prec + rec, 1e-9)
+    return {
+        "slot0_candidate_mae": float(np.mean(slot0_err)),
+        "slot0_candidate_rmse": float(np.sqrt(np.mean(slot0_err ** 2))),
+        "slot1_candidate_mae_valid_only": float(np.mean(slot1_err)) if len(slot1_err) else np.nan,
+        "slot1_candidate_rmse_valid_only": float(np.sqrt(np.mean(slot1_err ** 2))) if len(slot1_err) else np.nan,
+        "top1_candidate_hit_rate": float(top1_hit),
+        "top2_contains_gmpp_rate": float(top2_contains),
+        "candidate_ranking_accuracy": float(rank_acc),
+        "candidate_validity_precision": float(prec),
+        "candidate_validity_recall": float(rec),
+        "candidate_validity_f1": float(f1),
     }
 
 
@@ -1464,8 +1673,13 @@ def run_hybrid_ml_controller(
         "local_shade_score": local_escalation_score,
         "V_candidates": [local_v / max(oracle.voc, 1e-9)],
         "candidate_scores": [1.0 - local_escalation_score],
+        "candidate_confidences": [1.0 - local_escalation_score],
+        "candidate_valid_probs": [1.0],
         "candidate_disagreement": 0.0,
-        "candidate_scores_are_model_predicted": False,
+        "candidate_scores_are_model_predicted": True,
+        "candidate_generation_mode": "learned_multi_candidate",
+        "candidate_score_mode": "model_predicted",
+        "emergency_candidate_backup_used": False,
         "local_escalation_trigger_mode": local_escalation_trigger_mode,
         "local_shade_trigger_mode": local_escalation_trigger_mode,
     }
@@ -1505,7 +1719,7 @@ def run_hybrid_ml_controller(
         min_cand_score = float(np.min(cand_scores)) if len(cand_scores) else 0.0
         max_cand_score = float(np.max(cand_scores)) if len(cand_scores) else 0.0
 
-        cand_gate_th = float(calib.get("candidate_conf_threshold_calibrated", cfg.candidate_conf_threshold))
+        cand_gate_th = float(calib.get("learned_candidate_conf_threshold", calib.get("candidate_conf_threshold_calibrated", cfg.learned_candidate_conf_threshold)))
         if mean_cand_score < cand_gate_th:
             fallback = 1
             fallback_reason = "candidate_confidence_below_threshold"
@@ -1598,6 +1812,11 @@ def run_hybrid_ml_controller(
         "used_ml_candidates": int(enter_shade_mode and (fallback == 0)),
         "used_fallback_scan": int(fallback),
         "candidate_disagreement": float(pred.get("candidate_disagreement", 0.0)),
+        "V_candidates_pred": list(pred.get("V_candidates", [])),
+        "candidate_confidences_pred": list(pred.get("candidate_confidences", pred.get("candidate_scores", []))),
+        "candidate_valid_probs_pred": list(pred.get("candidate_valid_probs", [])),
+        "candidate_generation_mode_used": str(pred.get("candidate_generation_mode", "learned_multi_candidate")),
+        "emergency_candidate_backup_used": int(bool(pred.get("emergency_candidate_backup_used", False))),
         "norm_vhat_coarse_gap": float(abs((pred["vhat"] * oracle.voc) - coarse_best_v) / max(oracle.voc, 1e-9)) if enter_shade_mode else 0.0,
     }
 
@@ -1665,7 +1884,10 @@ def rows_to_arrays(rows: List[Dict]):
     seq = np.stack([r["seq"] for r in rows], axis=0).astype(np.float32)
     yv = np.array([r["y_vmpp_norm"] for r in rows], dtype=np.float32)
     ys = np.array([r["y_shade"] for r in rows], dtype=np.float32)
-    return flat, scalar, seq, yv, ys
+    y_cand_v = np.stack([r["y_cand_v"] for r in rows], axis=0).astype(np.float32)
+    y_cand_valid = np.stack([r["y_cand_valid"] for r in rows], axis=0).astype(np.float32)
+    y_cand_rank_target = np.stack([r["y_cand_rank_target"] for r in rows], axis=0).astype(np.float32)
+    return flat, scalar, seq, yv, ys, y_cand_v, y_cand_valid, y_cand_rank_target
 
 
 def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
@@ -1689,6 +1911,9 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
         "mean_candidate_confidence_deprecated_alias": mean_cand_score,
         "used_ml_candidates_rate": float(df["used_ml_candidates"].mean()) if "used_ml_candidates" in df else np.nan,
         "used_fallback_scan_rate": float(df["used_fallback_scan"].mean()) if "used_fallback_scan" in df else np.nan,
+        "learned_top_candidate_avoids_fallback_pct": float(100.0 * ((df["candidate_accept"] == 1) & (df["fallback"] == 0)).mean()) if "candidate_accept" in df else np.nan,
+        "candidate_set_contains_usable_near_gmpp_start_pct": float(100.0 * (df["best_candidate_pre_refine_power"] >= 0.98 * df["best_candidate_post_refine_power"]).mean()) if "best_candidate_pre_refine_power" in df else np.nan,
+        "rescued_by_widened_scan_after_candidate_failure_pct": float(100.0 * ((df["fallback"] == 1) & (df["candidate_reject_reason"] != "not_evaluated_local_track")).mean()) if "fallback" in df else np.nan,
     }
 
 
@@ -1892,13 +2117,13 @@ test_set_mode = split_info["test_set_mode"]
 heldout_shaded_count = split_info["heldout_shaded_count"]
 
 # standardizer fit on pretraining set
-sim_flat, sim_scalar, sim_seq, sim_yv, sim_ys = rows_to_arrays(sim_rows)
+sim_flat, sim_scalar, sim_seq, sim_yv, sim_ys, sim_ycv, sim_ycvd, sim_ycr = rows_to_arrays(sim_rows)
 stdz = fit_feature_standardizer(sim_flat, sim_scalar)
 
 sim_flat_n, sim_scalar_n, sim_seq_n = apply_standardizer(sim_flat, sim_scalar, sim_seq, stdz)
-exp_ft_flat, exp_ft_scalar, exp_ft_seq, exp_ft_yv, exp_ft_ys = rows_to_arrays(exp_ft_rows)
-exp_cal_flat, exp_cal_scalar, exp_cal_seq, exp_cal_yv, exp_cal_ys = rows_to_arrays(exp_cal_rows)
-exp_test_flat, exp_test_scalar, exp_test_seq, exp_test_yv, exp_test_ys = rows_to_arrays(exp_test_rows)
+exp_ft_flat, exp_ft_scalar, exp_ft_seq, exp_ft_yv, exp_ft_ys, exp_ft_ycv, exp_ft_ycvd, exp_ft_ycr = rows_to_arrays(exp_ft_rows)
+exp_cal_flat, exp_cal_scalar, exp_cal_seq, exp_cal_yv, exp_cal_ys, exp_cal_ycv, exp_cal_ycvd, exp_cal_ycr = rows_to_arrays(exp_cal_rows)
+exp_test_flat, exp_test_scalar, exp_test_seq, exp_test_yv, exp_test_ys, exp_test_ycv, exp_test_ycvd, exp_test_ycr = rows_to_arrays(exp_test_rows)
 
 exp_ft_flat_n, exp_ft_scalar_n, exp_ft_seq_n = apply_standardizer(exp_ft_flat, exp_ft_scalar, exp_ft_seq, stdz)
 exp_cal_flat_n, exp_cal_scalar_n, exp_cal_seq_n = apply_standardizer(exp_cal_flat, exp_cal_scalar, exp_cal_seq, stdz)
@@ -1912,11 +2137,11 @@ cnn = TinyHybridCNN(scalar_dim=3).to(cfg.device)
 idx = np.arange(len(sim_flat_n))
 tr, va = train_test_split(idx, test_size=0.15, random_state=cfg.seed)
 
-sim_train = (sim_flat_n[tr], sim_scalar_n[tr], sim_seq_n[tr], sim_yv[tr], sim_ys[tr])
-sim_val = (sim_flat_n[va], sim_scalar_n[va], sim_seq_n[va], sim_yv[va], sim_ys[va])
-exp_ft_arrays = (exp_ft_flat_n, exp_ft_scalar_n, exp_ft_seq_n, exp_ft_yv, exp_ft_ys)
-exp_cal_arrays = (exp_cal_flat_n, exp_cal_scalar_n, exp_cal_seq_n, exp_cal_yv, exp_cal_ys)
-exp_test_arrays = (exp_test_flat_n, exp_test_scalar_n, exp_test_seq_n, exp_test_yv, exp_test_ys)
+sim_train = (sim_flat_n[tr], sim_scalar_n[tr], sim_seq_n[tr], sim_yv[tr], sim_ys[tr], sim_ycv[tr], sim_ycvd[tr], sim_ycr[tr])
+sim_val = (sim_flat_n[va], sim_scalar_n[va], sim_seq_n[va], sim_yv[va], sim_ys[va], sim_ycv[va], sim_ycvd[va], sim_ycr[va])
+exp_ft_arrays = (exp_ft_flat_n, exp_ft_scalar_n, exp_ft_seq_n, exp_ft_yv, exp_ft_ys, exp_ft_ycv, exp_ft_ycvd, exp_ft_ycr)
+exp_cal_arrays = (exp_cal_flat_n, exp_cal_scalar_n, exp_cal_seq_n, exp_cal_yv, exp_cal_ys, exp_cal_ycv, exp_cal_ycvd, exp_cal_ycr)
+exp_test_arrays = (exp_test_flat_n, exp_test_scalar_n, exp_test_seq_n, exp_test_yv, exp_test_ys, exp_test_ycv, exp_test_ycvd, exp_test_ycr)
 
 print("\n=== 1) dataset summary ===")
 print({
@@ -2079,6 +2304,8 @@ print({"mlp": mlp_cal, "cnn": cnn_cal})
 # flat metrics
 mlp_flat = uncertainty_diagnostics(mlp, exp_test_arrays, mlp_cal, cfg)
 cnn_flat = uncertainty_diagnostics(cnn, exp_test_arrays, cnn_cal, cfg)
+mlp_candidate_metrics = candidate_head_diagnostics(mlp, exp_test_arrays, cfg)
+cnn_candidate_metrics = candidate_head_diagnostics(cnn, exp_test_arrays, cfg)
 
 # controller evaluations
 df_det, met_det = evaluate_controller(exp_test_rows, mode="deterministic", cfg=cfg)
@@ -2110,13 +2337,13 @@ print({"deterministic": sh_det, "mlp": sh_mlp, "cnn": sh_cnn})
 
 # PATCH 4: explicit coarse-scan shade detector report + separate local escalation detector report.
 def evaluate_coarse_shade_head(model, arrays, cfg: Config):
-    x_flat, x_scalar, x_seq, _yv, ys = arrays
+    x_flat, x_scalar, x_seq, _yv, ys, _ycv, _ycvd, _ycr = arrays
     model.eval()
     with torch.no_grad():
         xb = torch.tensor(x_flat, dtype=torch.float32, device=cfg.device)
         xs = torch.tensor(x_scalar, dtype=torch.float32, device=cfg.device)
         xq = torch.tensor(x_seq, dtype=torch.float32, device=cfg.device)
-        _, _, slogit = model(xb, xs, xq)
+        _, _, slogit, _cand_v, _cand_rank_logits, _cand_valid_logits = model(xb, xs, xq)
         probs = torch.sigmoid(slogit).cpu().numpy().astype(float)
     return ys.astype(int), probs
 
@@ -2415,9 +2642,9 @@ final_recommendation = {
     "dynamic_efficiency_gate": dynamic_efficiency_gate,
     "hil_validated": bool(hil_validated),
     # PATCH 5: explicit audit labels for candidate/local detector modes.
-    "candidate_mode": "deterministic_from_vhat_and_coarse_best",
-    "candidate_confidence_mode": "deterministic_score_not_model_predicted",
-    "candidate_design_decision": "intentional_engineering_choice_deterministic_candidates",
+    "candidate_mode": "learned_multi_candidate",
+    "candidate_confidence_mode": "model_predicted",
+    "candidate_design_decision": "learned_candidate_heads_with_runtime_verification",
     "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
@@ -2426,7 +2653,7 @@ final_recommendation = {
     "pilot_ready": bool(pilot_ready),
     "industry_ready": bool(industry_ready),
     "deployable": deployable,
-    "note": "ML predicts Vmpp prior + uncertainty only; candidate set construction/scoring remains deterministic; deterministic fallback remains final authority; dynamic/static standards gates are proxy_only until IEC/EN+HIL validation.",
+    "note": "ML predicts Vmpp prior + uncertainty + candidate voltages + candidate confidences; deterministic controller verifies learned candidates before accepting them; fallback remains the certifiable safety path; dynamic/static standards gates are proxy_only until IEC/EN+HIL validation.",
 }
 if final_recommendation["local_escalation_detector_mode"] == "deterministic_heuristic":
     final_recommendation["readiness_summary"] = (
@@ -2457,8 +2684,8 @@ print({
         "cnn": {k: cnn_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
     },
     "candidate_score_threshold_calibration": {
-        "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_threshold_calibration_mode"]},
-        "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_threshold_calibration_mode"]},
+        "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "learned_candidate_conf_threshold", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_accept_bal_acc", "candidate_threshold_calibration_mode"]},
+        "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "learned_candidate_conf_threshold", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_accept_bal_acc", "candidate_threshold_calibration_mode"]},
     },
     "local_escalation_trigger_threshold_calibration": {
         "mlp": {
@@ -2509,6 +2736,7 @@ print({
     "local_runtime_state_count": int(mlp_cal.get("local_runtime_state_count", 0)),
     "local_runtime_center_distribution": mlp_cal.get("local_runtime_center_distribution", {}),
     "local_runtime_detector_metrics": mlp_cal.get("local_runtime_detector_metrics", {}),
+    "candidate_head_metrics": {"mlp": mlp_candidate_metrics, "cnn": cnn_candidate_metrics},
 })
 print("\n=== B) test mode summary ===")
 print({
@@ -2655,9 +2883,9 @@ architecture_status = {
     "coarse_scan_ml_detector": True,
     "local_track_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_track_quick_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
-    "candidate_generation_mode": "deterministic_from_vhat_and_coarse_best",
-    "candidate_score_mode": "deterministic_score_not_model_predicted",
-    "candidate_scores_are_model_predicted": False,
+    "candidate_generation_mode": "learned_multi_candidate",
+    "candidate_score_mode": "model_predicted",
+    "candidate_scores_are_model_predicted": True,
     "deterministic_fallback_final_authority": True,
 }
 standards_validation_status = {
@@ -2688,8 +2916,8 @@ print({
 })
 print("\n=== I) controller audit modes ===")
 print({
-    "candidate_mode": "deterministic_from_vhat_and_coarse_best",
-    "candidate_confidence_mode": "deterministic_score_not_model_predicted",
+    "candidate_mode": "learned_multi_candidate",
+    "candidate_confidence_mode": "model_predicted",
     "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "shade_detection_modes": shade_detection_modes,
@@ -2779,13 +3007,33 @@ if SAVE_MODEL_BUNDLE:
         "local_runtime_center_distribution": local_runtime_state_summary.get("micro_runtime_center_distribution_cal", {}),
         "local_runtime_detector_metrics": local_runtime_detector_metrics,
         "candidate_score_threshold_calibration": {
-            "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_threshold_calibration_mode"]},
-            "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_threshold_calibration_mode"]},
+            "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "learned_candidate_conf_threshold", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_accept_bal_acc", "candidate_threshold_calibration_mode"]},
+            "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "learned_candidate_conf_threshold", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1", "candidate_accept_bal_acc", "candidate_threshold_calibration_mode"]},
+        },
+        "candidate_target_config": {
+            "num_candidates": int(cfg.num_candidates),
+            "peak_prominence_ratio": float(cfg.peak_prominence_ratio),
+            "peak_min_separation_ratio": float(cfg.peak_min_separation_ratio),
+            "candidate_secondary_power_floor_ratio": float(cfg.candidate_secondary_power_floor_ratio),
+        },
+        "candidate_head_config": {
+            "candidate_generation_mode": "learned_multi_candidate",
+            "candidate_score_mode": "model_predicted",
+            "candidate_scores_are_model_predicted": True,
+            "lambda_cand_v": float(cfg.lambda_cand_v),
+            "lambda_cand_rank": float(cfg.lambda_cand_rank),
+            "lambda_cand_valid": float(cfg.lambda_cand_valid),
+        },
+        "candidate_specific_metrics": {"mlp": mlp_candidate_metrics, "cnn": cnn_candidate_metrics},
+        "emergency_candidate_backup": {
+            "enabled": bool(cfg.use_emergency_deterministic_candidate_backup),
+            "mlp_usage_rate": float(df_mlp["emergency_candidate_backup_used"].mean()) if "emergency_candidate_backup_used" in df_mlp else 0.0,
+            "cnn_usage_rate": float(df_cnn["emergency_candidate_backup_used"].mean()) if "emergency_candidate_backup_used" in df_cnn else 0.0,
         },
         "split_metadata": split_info,
         "test_set_mode": test_set_mode,
-        "candidate_mode": "deterministic_from_vhat_and_coarse_best",
-        "candidate_confidence_mode": "deterministic_score_not_model_predicted",
+        "candidate_mode": "learned_multi_candidate",
+        "candidate_confidence_mode": "model_predicted",
         "local_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
         "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
         "shade_detection_modes": shade_detection_modes,
