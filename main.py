@@ -72,6 +72,7 @@ class Config:
     widen_scan_steps: int = 9
     fallback_sanity_ratio: float = 0.92
     shade_prob_threshold: float = 0.50
+    local_shade_trigger_threshold: float = 0.50
     weak_conf_for_multipeak: float = 0.60
     verify_ratio_threshold: float = 0.995
     candidate_accept_ratio_threshold: float = 1.002
@@ -85,6 +86,7 @@ class Config:
     static_efficiency_threshold: float = 0.99
     dynamic_efficiency_threshold: float = 0.99
     research_only_mode: bool = False
+    use_micro_ml_detector: bool = False
 
     # evaluation
     evaluate_all_test_curves: bool = True
@@ -798,6 +800,55 @@ def calibrate_shade_threshold(model, arrays_cal, cfg: Config) -> Dict[str, float
     }
 
 
+def calibrate_local_shade_trigger_threshold(rows_cal: List[Dict], cfg: Config) -> Dict[str, float]:
+    """PATCH 1: calibrate deterministic LOCAL_TRACK shade trigger threshold separately from ML shade head."""
+    y_true = []
+    y_score = []
+    for r in rows_cal:
+        oracle = CurveOracle(r["v_curve"], r["i_curve"])
+        center_v = float(np.clip(0.72 * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+        y_true.append(int(r["y_shade"]))
+        y_score.append(float(microscan_shade_heuristic_score(oracle, center_v, cfg)))
+
+    if len(y_score) == 0:
+        return {
+            "local_shade_trigger_threshold": float(cfg.local_shade_trigger_threshold),
+            "local_shade_precision": 0.0,
+            "local_shade_recall": 0.0,
+            "local_shade_f1": 0.0,
+            "local_shade_bal_acc": 0.0,
+        }
+
+    y_true = np.asarray(y_true, dtype=int)
+    y_score = np.asarray(y_score, dtype=float)
+    best = {
+        "threshold": float(cfg.local_shade_trigger_threshold),
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "bal_acc": 0.0,
+    }
+    for th in np.linspace(0.1, 0.9, 17):
+        m = compute_binary_metrics(y_true, y_score, float(th))
+        curr = (m["recall"], m["balanced_accuracy"], m["f1"])
+        prev = (best["recall"], best["bal_acc"], best["f1"])
+        if curr > prev:
+            best = {
+                "threshold": float(th),
+                "precision": float(m["precision"]),
+                "recall": float(m["recall"]),
+                "f1": float(m["f1"]),
+                "bal_acc": float(m["balanced_accuracy"]),
+            }
+    return {
+        "local_shade_trigger_threshold": best["threshold"],
+        "local_shade_precision": best["precision"],
+        "local_shade_recall": best["recall"],
+        "local_shade_f1": best["f1"],
+        "local_shade_bal_acc": best["bal_acc"],
+    }
+
+
 def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib: Dict[str, float], cfg: Config) -> Dict[str, float]:
     """PATCH 3: calibrate candidate score threshold on calibration split (safety-oriented)."""
     score_list = []
@@ -988,6 +1039,37 @@ def microscan_shade_heuristic_score(
     return float(np.clip(score, 0.0, 1.0))
 
 
+def build_micro_scan_features(oracle: CurveOracle, center_v: float, cfg: Config) -> Dict[str, float]:
+    """PATCH 4: placeholder micro-scan feature interface for future dedicated local ML detector."""
+    vm = float(np.clip(center_v, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    vl = float(np.clip(vm * (1 - cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    vr = float(np.clip(vm * (1 + cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
+    p0 = float(vm * oracle.measure(vm))
+    pl = float(vl * oracle.measure(vl))
+    pr = float(vr * oracle.measure(vr))
+    return {
+        "vm_norm": float(vm / max(oracle.voc, 1e-9)),
+        "pl_norm": float(pl / max(oracle.pmpp_true, 1e-9)),
+        "p0_norm": float(p0 / max(oracle.pmpp_true, 1e-9)),
+        "pr_norm": float(pr / max(oracle.pmpp_true, 1e-9)),
+    }
+
+
+def train_micro_shade_detector(rows_train: List[Dict], cfg: Config):
+    """PATCH 4: placeholder for future dedicated micro-scan shade detector training."""
+    _ = rows_train
+    _ = cfg
+    raise NotImplementedError("Micro-scan ML detector training is a stub. Provide dedicated labels/features before enabling.")
+
+
+def micro_ml_predict(micro_detector, micro_features: Dict[str, float], cfg: Config) -> float:
+    """PATCH 4: placeholder inference interface for dedicated micro-scan ML detector."""
+    _ = micro_detector
+    _ = micro_features
+    _ = cfg
+    raise NotImplementedError("Micro-scan ML detector inference is a stub. Keep use_micro_ml_detector=False for now.")
+
+
 def run_deterministic_baseline(oracle: CurveOracle, cfg: Config) -> Dict[str, float]:
     vq = cfg.sample_fracs * oracle.voc
     pq = np.array([v * oracle.measure(v) for v in vq], dtype=float)
@@ -1038,19 +1120,26 @@ def run_hybrid_ml_controller(
     v_curr = float(runtime_state.get("v_operating", 0.72 * oracle.voc))
     v_curr = float(np.clip(v_curr, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
 
-    # -------- PATCH 1 + PATCH 2: runtime mode scheduler (deterministic local shade heuristic) --------
+    # -------- PATCH 1 + PATCH 2 + PATCH 4: runtime mode scheduler (separate local trigger path) --------
     local_v, local_p, _ = refine_local(oracle, v_curr, cfg)
     local_left = float(np.clip(local_v * (1 - cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
     local_right = float(np.clip(local_v * (1 + cfg.delta_local), cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
     p_left = float(local_left * oracle.measure(local_left))
     p_right = float(local_right * oracle.measure(local_right))
     local_spread = abs(p_right - p_left) / max(local_p, 1e-9)
-    local_shade_score = microscan_shade_heuristic_score(oracle, local_v, cfg)
+    local_shade_trigger_mode = "deterministic_heuristic"
+    if cfg.use_micro_ml_detector:
+        local_shade_trigger_mode = "micro_ml_detector"
+        micro_features = build_micro_scan_features(oracle, local_v, cfg)
+        local_shade_score = float(micro_ml_predict(calib.get("micro_shade_detector", None), micro_features, cfg))
+    else:
+        local_shade_score = microscan_shade_heuristic_score(oracle, local_v, cfg)
 
     prev_p = float(runtime_state.get("last_power", local_p))
     anomaly_trigger = int(local_p < cfg.anomaly_drop_ratio * max(prev_p, 1e-9))
     periodic_safety_trigger = int((episode_idx + 1) % max(cfg.periodic_safety_interval, 1) == 0)
-    shade_trigger_local = int(local_shade_score >= calib.get("shade_threshold", cfg.shade_prob_threshold))
+    local_shade_trigger_threshold = float(calib.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))
+    shade_trigger_local = int(local_shade_score >= local_shade_trigger_threshold)
     enter_shade_mode = bool(shade_trigger_local or periodic_safety_trigger or anomaly_trigger)
     mode = "SHADE_GMPPT" if enter_shade_mode else "LOCAL_TRACK"
 
@@ -1059,13 +1148,14 @@ def run_hybrid_ml_controller(
     vbest, pbest = ref_v, ref_p
     pred = {
         "vhat": local_v / max(oracle.voc, 1e-9),
-        "confidence": 1.0 - 0.5 * local_shade_score,
+        "confidence": 1.0 - 0.5 * local_shade_score,  # backward-compatible alias (LOCAL_TRACK heuristic score)
         "sigma": 0.0,
         "raw_sigma": 0.0,
         "shade_flag": shade_trigger_local,
-        "shade_prob": local_shade_score,
+        "shade_prob": local_shade_score,  # backward-compatible alias to local_shade_score
+        "local_shade_score": local_shade_score,
         "V_candidates": [local_v / max(oracle.voc, 1e-9)],
-        "candidate_confidences": [1.0 - local_shade_score],
+        "candidate_confidences": [1.0 - local_shade_score],  # backward-compatible alias to candidate_scores
         "candidate_scores": [1.0 - local_shade_score],
         "candidate_disagreement": 0.0,
         "candidate_scores_are_model_predicted": False,
@@ -1180,7 +1270,10 @@ def run_hybrid_ml_controller(
         "sigma_vhat": pred["sigma"],
         "raw_sigma_vhat": pred["raw_sigma"],
         "shade_flag": int(pred["shade_flag"]),
-        "shade_prob": float(pred["shade_prob"]),
+        "shade_prob": float(pred["shade_prob"]),  # backward-compatible alias to local_shade_score in LOCAL_TRACK
+        "local_shade_score": float(local_shade_score),
+        "local_shade_trigger_threshold": float(local_shade_trigger_threshold),
+        "local_shade_trigger_mode": local_shade_trigger_mode,
         "coarse_multipeak": coarse_multipeak,
         "low_confidence": low_confidence,
         "sanity_trigger": sanity_trigger,
@@ -1197,9 +1290,9 @@ def run_hybrid_ml_controller(
         "mean_candidate_score": float(mean_cand_score),
         "candidate_score_min": float(min_cand_score),
         "candidate_score_max": float(max_cand_score),
-        "mean_candidate_confidence": float(mean_cand_score),  # backward-compatible alias
-        "candidate_confidence_min": float(min_cand_score),  # backward-compatible alias
-        "candidate_confidence_max": float(max_cand_score),  # backward-compatible alias
+        "mean_candidate_confidence": float(mean_cand_score),  # backward-compatible alias to mean_candidate_score
+        "candidate_confidence_min": float(min_cand_score),  # backward-compatible alias to candidate_score_min
+        "candidate_confidence_max": float(max_cand_score),  # backward-compatible alias to candidate_score_max
         "used_ml_candidates": int(enter_shade_mode and (fallback == 0)),
         "used_fallback_scan": int(fallback),
         "candidate_disagreement": float(pred.get("candidate_disagreement", 0.0)),
@@ -1512,8 +1605,11 @@ mlp_cal = calibrate_uncertainty(mlp, exp_cal_arrays, cfg)
 cnn_cal = calibrate_uncertainty(cnn, exp_cal_arrays, cfg)
 mlp_shade_cal = calibrate_shade_threshold(mlp, exp_cal_arrays, cfg)
 cnn_shade_cal = calibrate_shade_threshold(cnn, exp_cal_arrays, cfg)
+local_shade_cal = calibrate_local_shade_trigger_threshold(exp_cal_rows, cfg)
 mlp_cal.update(mlp_shade_cal)
 cnn_cal.update(cnn_shade_cal)
+mlp_cal.update(local_shade_cal)
+cnn_cal.update(local_shade_cal)
 # PATCH 3: candidate score threshold calibration (safety-oriented accept gate).
 mlp_candidate_cal = calibrate_candidate_score_threshold(mlp, exp_cal_rows, stdz, mlp_cal, cfg)
 cnn_candidate_cal = calibrate_candidate_score_threshold(cnn, exp_cal_rows, stdz, cnn_cal, cfg)
@@ -1568,7 +1664,7 @@ def evaluate_coarse_shade_head(model, arrays, cfg: Config):
     return ys.astype(int), probs
 
 
-def evaluate_local_heuristic_shade(rows: List[Dict], cfg: Config):
+def evaluate_local_heuristic_shade(rows: List[Dict], cfg: Config, threshold: float):
     y_true = []
     y_score = []
     for r in rows:
@@ -1577,18 +1673,39 @@ def evaluate_local_heuristic_shade(rows: List[Dict], cfg: Config):
         center_v = float(np.clip(0.72 * oracle.voc, cfg.sample_fracs_min * oracle.voc, cfg.sample_fracs_max * oracle.voc))
         y_true.append(int(r["y_shade"]))
         y_score.append(float(microscan_shade_heuristic_score(oracle, center_v, cfg)))
-    return np.asarray(y_true, dtype=int), np.asarray(y_score, dtype=float)
+    y_true = np.asarray(y_true, dtype=int)
+    y_score = np.asarray(y_score, dtype=float)
+    return y_true, y_score, compute_binary_metrics(y_true, y_score, threshold)
 
 
 y_true_mlp, y_score_mlp = evaluate_coarse_shade_head(mlp, exp_test_arrays, cfg)
 y_true_cnn, y_score_cnn = evaluate_coarse_shade_head(cnn, exp_test_arrays, cfg)
-y_true_local, y_score_local = evaluate_local_heuristic_shade(exp_test_rows, cfg)
+local_trigger_threshold_mlp = float(mlp_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))
+local_trigger_threshold_cnn = float(cnn_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold))
+y_true_local, y_score_local, local_metrics_mlp = evaluate_local_heuristic_shade(exp_test_rows, cfg, local_trigger_threshold_mlp)
+_y_true_local_cnn, _y_score_local_cnn, local_metrics_cnn = evaluate_local_heuristic_shade(exp_test_rows, cfg, local_trigger_threshold_cnn)
+shade_detection_modes = {
+    "coarse_scan_detector_mode": "ml_classifier",
+    "local_track_detector_mode": "deterministic_heuristic" if not cfg.use_micro_ml_detector else "micro_ml_detector",
+    "coarse_scan_detector_thresholds": {
+        "mlp": float(mlp_cal["shade_threshold"]),
+        "cnn": float(cnn_cal["shade_threshold"]),
+    },
+    "local_track_trigger_threshold": {
+        "mlp": local_trigger_threshold_mlp,
+        "cnn": local_trigger_threshold_cnn,
+    },
+}
 shade_detector_report = {
-    "coarse_scan_shade_head_mlp": compute_binary_metrics(y_true_mlp, y_score_mlp, mlp_cal["shade_threshold"]),
-    "coarse_scan_shade_head_cnn": compute_binary_metrics(y_true_cnn, y_score_cnn, cnn_cal["shade_threshold"]),
-    "micro_scan_local_detector": {
-        "mode": "deterministic_heuristic",
-        **compute_binary_metrics(y_true_local, y_score_local, cfg.shade_prob_threshold),
+    "modes": shade_detection_modes,
+    "coarse_scan_ml_detector": {
+        "mlp": compute_binary_metrics(y_true_mlp, y_score_mlp, mlp_cal["shade_threshold"]),
+        "cnn": compute_binary_metrics(y_true_cnn, y_score_cnn, cnn_cal["shade_threshold"]),
+    },
+    "local_track_detector": {
+        "mode": shade_detection_modes["local_track_detector_mode"],
+        "mlp_route_metrics": local_metrics_mlp,
+        "cnn_route_metrics": local_metrics_cnn,
     },
 }
 print("\n=== 9B) shade detector report ===")
@@ -1753,7 +1870,7 @@ final_recommendation = {
     # PATCH 5: explicit audit labels for candidate/local detector modes.
     "candidate_mode": "deterministic_from_vhat_and_coarse_best",
     "candidate_confidence_mode": "deterministic_score_not_model_predicted",
-    "local_shade_detector_mode": "deterministic_heuristic",
+    "local_shade_detector_mode": "deterministic_heuristic" if not cfg.use_micro_ml_detector else "micro_ml_detector",
     "strict_gate_status": strict_gates,
     "research_recommended": bool(research_recommended),
     "pilot_ready": bool(pilot_ready),
@@ -1761,6 +1878,17 @@ final_recommendation = {
     "deployable": deployable,
     "note": "Deterministic fallback remains final authority; dynamic/static standards gates are proxy_only until IEC/EN+HIL validation.",
 }
+if final_recommendation["local_shade_detector_mode"] == "deterministic_heuristic":
+    final_recommendation["readiness_summary"] = (
+        "Hybrid architecture is credible for research/pilot iteration, but LOCAL_TRACK quick shade trigger is deterministic heuristic, not learned micro-ML."
+    )
+else:
+    final_recommendation["readiness_summary"] = (
+        "Hybrid architecture includes ML coarse detector and micro-ML local trigger path; still requires external certification evidence."
+    )
+final_recommendation["remaining_gap_summary"] = (
+    "Real IEC/EN static and dynamic validation plus HIL evidence are required before any industry-ready claim."
+)
 
 print("\n=== 12) preliminary recommendation (updated after dynamic + compute gates) ===")
 print(final_recommendation)
@@ -1781,6 +1909,10 @@ print({
     "candidate_score_threshold_calibration": {
         "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
         "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
+    },
+    "local_shade_trigger_threshold_calibration": {
+        "mlp": {k: mlp_cal[k] for k in ["local_shade_trigger_threshold", "local_shade_precision", "local_shade_recall", "local_shade_f1", "local_shade_bal_acc"]},
+        "cnn": {k: cnn_cal[k] for k in ["local_shade_trigger_threshold", "local_shade_precision", "local_shade_recall", "local_shade_f1", "local_shade_bal_acc"]},
     },
 })
 print("\n=== B) test mode summary ===")
@@ -1886,6 +2018,9 @@ final_recommendation["dynamic_transition_proxy_efficiency"] = dynamic_proxy_eff
 final_recommendation["static_efficiency_gate"] = static_efficiency_gate
 final_recommendation["dynamic_efficiency_gate"] = dynamic_efficiency_gate
 final_recommendation["hil_validated"] = hil_validated
+final_recommendation["has_true_standard_static"] = bool(has_true_standard_static)
+final_recommendation["has_true_standard_dynamic"] = bool(has_true_standard_dynamic)
+final_recommendation["frozen_firmware_release_evidence"] = bool(frozen_firmware_release_evidence)
 final_recommendation["pilot_ready"] = bool(pilot_ready)
 final_recommendation["industry_ready"] = industry_ready
 final_recommendation["deployable"] = deployable
@@ -1909,7 +2044,15 @@ print("\n=== I) controller audit modes ===")
 print({
     "candidate_mode": "deterministic_from_vhat_and_coarse_best",
     "candidate_confidence_mode": "deterministic_score_not_model_predicted",
-    "local_shade_detector_mode": "deterministic_heuristic",
+    "local_shade_detector_mode": "deterministic_heuristic" if not cfg.use_micro_ml_detector else "micro_ml_detector",
+    "shade_detection_modes": shade_detection_modes,
+})
+print("\n=== J) standards/HIL evidence flags ===")
+print({
+    "has_true_standard_static": bool(has_true_standard_static),
+    "has_true_standard_dynamic": bool(has_true_standard_dynamic),
+    "hil_validated": bool(hil_validated),
+    "frozen_firmware_release_evidence": bool(frozen_firmware_release_evidence),
 })
 
 if MAKE_PLOTS:
@@ -1930,6 +2073,10 @@ if SAVE_MODEL_BUNDLE:
             "mlp": {k: mlp_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
             "cnn": {k: cnn_cal[k] for k in ["shade_threshold", "shade_precision", "shade_recall", "shade_f1", "shade_bal_acc"]},
         },
+        "local_shade_trigger_threshold_calibration": {
+            "mlp": {k: mlp_cal[k] for k in ["local_shade_trigger_threshold", "local_shade_precision", "local_shade_recall", "local_shade_f1", "local_shade_bal_acc"]},
+            "cnn": {k: cnn_cal[k] for k in ["local_shade_trigger_threshold", "local_shade_precision", "local_shade_recall", "local_shade_f1", "local_shade_bal_acc"]},
+        },
         "candidate_score_threshold_calibration": {
             "mlp": {k: mlp_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
             "cnn": {k: cnn_cal[k] for k in ["candidate_conf_threshold_calibrated", "candidate_accept_precision", "candidate_accept_recall", "candidate_accept_f1"]},
@@ -1938,7 +2085,8 @@ if SAVE_MODEL_BUNDLE:
         "test_set_mode": test_set_mode,
         "candidate_mode": "deterministic_from_vhat_and_coarse_best",
         "candidate_confidence_mode": "deterministic_score_not_model_predicted",
-        "local_shade_detector_mode": "deterministic_heuristic",
+        "local_shade_detector_mode": "deterministic_heuristic" if not cfg.use_micro_ml_detector else "micro_ml_detector",
+        "shade_detection_modes": shade_detection_modes,
         "shade_detector_report": shade_detector_report,
         "drift_baselines": {"mlp": drift_baseline_mlp, "cnn": drift_baseline_cnn},
         "drift_thresholds": {
@@ -1960,6 +2108,10 @@ if SAVE_MODEL_BUNDLE:
         "dynamic_transition_proxy_report": {"mlp": dynamic_transition_proxy_report_mlp, "cnn": dynamic_transition_proxy_report_cnn},
         "standards_dynamic_energy_report": standards_dynamic_energy_report,
         "standards_reporting_hooks": standards_reporting,
+        "has_true_standard_static": bool(has_true_standard_static),
+        "has_true_standard_dynamic": bool(has_true_standard_dynamic),
+        "hil_validated": bool(hil_validated),
+        "frozen_firmware_release_evidence": bool(frozen_firmware_release_evidence),
         "compute_profiling_summary": compute_profile,
         "final_recommendation": final_recommendation,
     }
