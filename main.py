@@ -2894,8 +2894,12 @@ final_recommendation["external_validation_bundle_source"] = external_validation_
 final_recommendation["pilot_ready"] = bool(pilot_ready)
 final_recommendation["industry_ready"] = industry_ready
 final_recommendation["deployable"] = deployable
+final_recommendation["validation_status_summary"] = (
+    "Learned candidate heads are active in SHADE_GMPPT mode, deterministic fallback remains final authority, "
+    "and external IEC/EN static + dynamic + HIL evidence must be loaded and pass all gates before industry_ready can be True."
+)
 final_recommendation["architecture_summary_text"] = (
-    "Learned candidate heads are used in SHADE_GMPPT mode. LOCAL_TRACK mode uses local escalation logic "
+    "Learned candidate heads are used only in SHADE_GMPPT mode. LOCAL_TRACK mode uses local escalation logic "
     "with placeholder candidate fields for audit continuity only. Deterministic fallback remains final authority."
 )
 final_recommendation["strict_gate_status"] = {
@@ -2928,7 +2932,7 @@ print(final_recommendation)
 architecture_status = {
     "coarse_scan_ml_detector": True,
     "local_track_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
-    "local_track_quick_detector_mode": "micro_ml",
+    "local_track_quick_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "candidate_generation_mode": "learned_multi_candidate_in_shade_gmppt_mode",
     "candidate_score_mode": "model_predicted_in_shade_gmppt_mode",
     "candidate_scores_are_model_predicted": True,
@@ -3125,6 +3129,7 @@ if SAVE_MODEL_BUNDLE:
         "external_validation_bundle": external_validation_bundle,
         "external_validation_bundle_loaded": bool(external_validation_bundle.get("loaded", False)),
         "external_validation_bundle_source": external_validation_bundle.get("source", None),
+        "validation_status_summary": final_recommendation.get("validation_status_summary"),
         "architecture_status": architecture_status,
         "standards_validation_status": standards_validation_status,
         "hil_validation_status": hil_validation_status,
