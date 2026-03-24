@@ -107,6 +107,8 @@ class Config:
     confidence_threshold: float = 0.55
     shade_threshold_default: float = 0.50
     coarse_scan_points: int = 24
+    sample_fracs_min: float = 0.35
+    sample_fracs_max: float = 0.90
     local_refine_window: float = 0.12
     local_refine_steps: int = 21
     widened_scan_points: int = 96
@@ -118,6 +120,7 @@ class Config:
     local_track_false_trigger_rate_max: float = 0.10
     local_track_escalation_recall_min: float = 0.75
     nonshaded_no_harm_tolerance: float = 0.002
+    micro_escalate_ratio_threshold: float = 1.02
 
     # validation flags (must all be true to claim industry-ready)
     has_true_standard_static: bool = False
@@ -504,12 +507,13 @@ class ProductionMLP(nn.Module):
         self.logvar_head = nn.Linear(32, 1)
         self.shade_head = nn.Linear(32, 1)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.backbone(x)
-        mean = self.mean_head(h).squeeze(-1)
+        mean_raw = self.mean_head(h).squeeze(-1)
+        mean = torch.sigmoid(mean_raw)
         logvar = self.logvar_head(h).squeeze(-1)
         shade_logit = self.shade_head(h).squeeze(-1)
-        return {"mean": mean, "logvar": logvar, "shade_logit": shade_logit}
+        return mean, logvar, shade_logit
 
     @torch.no_grad()
     def predict_production(
@@ -522,14 +526,15 @@ class ProductionMLP(nn.Module):
         sigma_high: float,
     ) -> Dict[str, np.ndarray]:
         self.eval()
-        out = self.forward(x)
-        logvar = torch.clamp(out["logvar"], min=logvar_min, max=logvar_max)
+        mean, logvar_raw, shade_logit = self.forward(x)
+        logvar = torch.clamp(logvar_raw, min=logvar_min, max=logvar_max)
         sigma = torch.exp(0.5 * logvar)
         confidence = 1.0 - torch.clamp((sigma - sigma_low) / max(sigma_high - sigma_low, 1e-6), 0.0, 1.0)
-        shade_prob = torch.sigmoid(out["shade_logit"])
+        shade_prob = torch.sigmoid(shade_logit)
         shade_flag = (shade_prob >= shade_threshold).float()
         return {
-            "vhat": out["mean"].cpu().numpy(),
+            "vhat_norm": mean.cpu().numpy(),
+            "raw_sigma": torch.exp(0.5 * logvar_raw).cpu().numpy(),
             "sigma": sigma.cpu().numpy(),
             "confidence": confidence.cpu().numpy(),
             "shade_prob": shade_prob.cpu().numpy(),
@@ -579,9 +584,9 @@ def _run_epoch(
         yv = yv.to(cfg.device)
         ys = ys.to(cfg.device)
 
-        out = model(xb)
-        loss_main = hetero_regression_loss(out["mean"], out["logvar"], yv, cfg.logvar_min, cfg.logvar_max)
-        loss_shade = F.binary_cross_entropy_with_logits(out["shade_logit"], ys)
+        mean, logvar, shade_logit = model(xb)
+        loss_main = hetero_regression_loss(mean, logvar, yv, cfg.logvar_min, cfg.logvar_max)
+        loss_shade = F.binary_cross_entropy_with_logits(shade_logit, ys)
 
         l2 = torch.tensor(0.0, device=cfg.device)
         for p in model.parameters():
@@ -753,6 +758,10 @@ class CurveOracle:
     def __init__(self, v: np.ndarray, i: np.ndarray):
         self.v = np.asarray(v).reshape(-1)
         self.i = np.asarray(i).reshape(-1)
+        dense = compute_mpp_dense(self.v, self.i)
+        self.vmpp_true = float(dense["vmpp"])
+        self.pmpp_true = float(dense["pmpp"])
+        self.voc = float(np.max(self.v)) if len(self.v) > 0 else 0.0
 
     def power_at(self, vq: float) -> float:
         iq = float(np.interp(vq, self.v, self.i, left=self.i[0], right=self.i[-1]))
@@ -825,22 +834,46 @@ def build_micro_scan_features(v_hist: Sequence[float], p_hist: Sequence[float], 
     return feat
 
 
-def collect_local_track_runtime_states(curves_v: np.ndarray, curves_i: np.ndarray) -> List[Dict[str, Any]]:
+def collect_local_track_runtime_states(curves_v: np.ndarray, curves_i: np.ndarray, cfg: Config) -> List[Dict[str, Any]]:
     states: List[Dict[str, Any]] = []
+    escalation_gain_ratio_list: List[float] = []
     for v, i in zip(curves_v, curves_i):
         v, i = clean_iv_curve(v, i)
         if not validate_cleaned_curve(v, i):
             continue
         p = v * i
+        oracle = CurveOracle(v, i)
         center = int(len(v) // 2)
         center_v = float(v[center])
-        voc = float(np.max(v)) if len(v) > 0 else 1.0
-        center_norm = float(center_v / max(voc, 1e-6))
+        center_norm = float(center_v / max(oracle.voc, 1e-6))
         band = physical_center_band_label(center_norm)
         feat = build_micro_scan_features(v[max(0, center - 3): center + 4], p[max(0, center - 3): center + 4], center_norm)
-        local_peak_count = count_local_maxima(p)
-        target = 1 if local_peak_count >= 2 else 0
-        states.append({"x": feat, "y": target, "band": band, "center_norm": center_norm})
+        local_ref = refine_local(
+            oracle,
+            center_v,
+            voc=oracle.voc,
+            window_ratio=cfg.local_refine_window,
+            steps=cfg.local_refine_steps,
+        )
+        local_p_best = float(local_ref["p"])
+        global_v_true = float(oracle.vmpp_true)
+        global_p_true = float(oracle.pmpp_true)
+        escalation_gain_ratio = float(global_p_true / max(local_p_best, 1e-9))
+        target = int(global_p_true >= cfg.micro_escalate_ratio_threshold * max(local_p_best, 1e-9))
+        escalation_gain_ratio_list.append(escalation_gain_ratio)
+        states.append(
+            {
+                "x": feat,
+                "y": target,
+                "band": band,
+                "center_norm": center_norm,
+                "local_p_best": local_p_best,
+                "global_p_true": global_p_true,
+                "global_v_true": global_v_true,
+                "escalation_gain_ratio": escalation_gain_ratio,
+            }
+        )
+    assert np.all(np.isfinite(np.asarray(escalation_gain_ratio_list, dtype=float)))
     return states
 
 
@@ -941,6 +974,31 @@ def _confidence_from_sigma(sigma: float, cfg: Config) -> float:
     return float(1.0 - np.clip((sigma - cfg.uncertainty_sigma_low) / max(cfg.uncertainty_sigma_high - cfg.uncertainty_sigma_low, 1e-6), 0.0, 1.0))
 
 
+def model_predict_api(
+    model: ProductionMLP,
+    x_feat_std: np.ndarray,
+    shade_threshold: float,
+    cfg: Config,
+) -> Dict[str, float]:
+    with torch.no_grad():
+        pred = model.predict_production(
+            torch.from_numpy(x_feat_std.reshape(1, -1)).float().to(cfg.device),
+            shade_threshold=shade_threshold,
+            logvar_min=cfg.logvar_min,
+            logvar_max=cfg.logvar_max,
+            sigma_low=cfg.uncertainty_sigma_low,
+            sigma_high=cfg.uncertainty_sigma_high,
+        )
+    return {
+        "vhat_norm": float(pred["vhat_norm"][0]),
+        "raw_sigma": float(pred["raw_sigma"][0]),
+        "sigma": float(pred["sigma"][0]),
+        "confidence": float(pred["confidence"][0]),
+        "shade_prob": float(pred["shade_prob"][0]),
+        "shade_flag": bool(pred["shade_flag"][0] > 0.5),
+    }
+
+
 def run_hybrid_controller(
     curve_v: np.ndarray,
     curve_i: np.ndarray,
@@ -986,21 +1044,12 @@ def run_hybrid_controller(
     escalate = local_detector_trigger and (anomaly_trigger or periodic_safety_trigger)
 
     # SHADE_GMPPT advisory path
-    with torch.no_grad():
-        pred = model.predict_production(
-            torch.from_numpy(x_feat_std.reshape(1, -1)).float().to(cfg.device),
-            shade_threshold=shade_threshold,
-            logvar_min=cfg.logvar_min,
-            logvar_max=cfg.logvar_max,
-            sigma_low=cfg.uncertainty_sigma_low,
-            sigma_high=cfg.uncertainty_sigma_high,
-        )
-
-    vhat = float(pred["vhat"][0])
-    sigma = float(pred["sigma"][0])
-    confidence = float(pred["confidence"][0])
-    shade_prob = float(pred["shade_prob"][0])
-    shade_flag = bool(pred["shade_flag"][0] > 0.5)
+    pred = model_predict_api(model, x_feat_std, shade_threshold, cfg)
+    assert 0.0 <= pred["vhat_norm"] <= 1.0
+    sigma = float(pred["sigma"])
+    confidence = float(pred["confidence"])
+    shade_prob = float(pred["shade_prob"])
+    shade_flag = bool(pred["shade_flag"])
 
     low_conf = confidence < cfg.confidence_threshold
 
@@ -1009,7 +1058,16 @@ def run_hybrid_controller(
         mode = "shade_gmppt_low_conf_widened_scan"
         used_fallback = True
     else:
-        candidate = refine_local(oracle, vhat, voc=max(v), window_ratio=cfg.local_refine_window, steps=cfg.local_refine_steps)
+        v_seed = float(
+            np.clip(
+                pred["vhat_norm"] * oracle.voc,
+                cfg.sample_fracs_min * oracle.voc,
+                cfg.sample_fracs_max * oracle.voc,
+            )
+        )
+        assert np.isfinite(v_seed)
+        assert 0.0 <= v_seed <= oracle.voc + 1e-9
+        candidate = refine_local(oracle, v_seed, voc=max(v), window_ratio=cfg.local_refine_window, steps=cfg.local_refine_steps)
         mode = "shade_gmppt_refine_single_prior"
         used_fallback = False
 
@@ -1047,7 +1105,8 @@ def run_hybrid_controller(
         "anomaly_trigger": bool(anomaly_trigger),
         "periodic_safety_trigger": bool(periodic_safety_trigger),
         "escalated": bool(escalate),
-        "vhat": vhat,
+        "vhat_norm": float(pred["vhat_norm"]),
+        "raw_sigma": float(pred["raw_sigma"]),
         "sigma": sigma,
         "confidence": confidence,
         "shade_prob": shade_prob,
@@ -1248,6 +1307,7 @@ def _prepare_features(dataset: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     y_shade = np.asarray(dataset["labels_shaded"]).astype(np.float32).reshape(-1)
     source_domain = np.asarray(dataset["source_domain"], dtype=object).reshape(-1)
     source_domain = np.array([str(x).strip().lower() for x in source_domain], dtype=object)
+    source_domain = np.array(["simulation" if x == "simulated" else x for x in source_domain], dtype=object)
     dynamic_flags = np.asarray(dataset["dynamic_flags"]).astype(np.int32).reshape(-1)
 
     features: List[np.ndarray] = []
@@ -1327,6 +1387,7 @@ def _prepare_features(dataset: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
 
 def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
     test = prep["exp_split"]["test"]
+    sim_pool = np.concatenate([prep["sim_split"]["train"], prep["sim_split"]["val"]])
     y_shade = prep["y_shade"]
     source = prep["source_domain"]
     peaks = prep["dense_peak_count"]
@@ -1335,7 +1396,7 @@ def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
     nonshaded_test = test[y_shade[test] < 0.5]
     folder_labeled_shaded_test = test[(source[test] == "experimental") & (y_shade[test] >= 0.5)]
     true_multipeak_exp_test = test[(source[test] == "experimental") & (peaks[test] >= 2)]
-    true_multipeak_sim_benchmark = test[(source[test] == "simulation") & (peaks[test] >= 2)]
+    true_multipeak_sim_benchmark = sim_pool[peaks[sim_pool] >= 2]
     dynamic_transition_test = test[dyn[test] > 0]
 
     simulated_multipeak_used = False
@@ -1423,12 +1484,25 @@ def main() -> None:
             sigma_high=cfg.uncertainty_sigma_high,
         )
 
-    unc_cal = calibrate_uncertainty(va_pred["sigma"], np.abs(va_pred["vhat"] - yv[exp_split["val"]]))
+    unc_cal = calibrate_uncertainty(va_pred["sigma"], np.abs(va_pred["vhat_norm"] - yv[exp_split["val"]]))
     shade_thr = calibrate_shade_threshold(va_pred["shade_prob"], ys[exp_split["val"]])
+    vhat_norm_mean = float(np.mean(va_pred["vhat_norm"])) if len(va_pred["vhat_norm"]) else 0.0
+    vhat_norm_std = float(np.std(va_pred["vhat_norm"])) if len(va_pred["vhat_norm"]) else 0.0
 
     # micro detector pipeline
-    local_states = collect_local_track_runtime_states(prep["curves_v"][exp_split["train"]], prep["curves_i"][exp_split["train"]])
-    mx, my, mb = build_micro_dataset(local_states)
+    local_states_train = collect_local_track_runtime_states(
+        prep["curves_v"][exp_split["train"]], prep["curves_i"][exp_split["train"]], cfg
+    )
+    local_states_val = collect_local_track_runtime_states(
+        prep["curves_v"][exp_split["val"]], prep["curves_i"][exp_split["val"]], cfg
+    )
+    local_states_test = collect_local_track_runtime_states(
+        prep["curves_v"][exp_split["test"]], prep["curves_i"][exp_split["test"]], cfg
+    )
+    local_states = local_states_train + local_states_val + local_states_test
+    mx, my, mb = build_micro_dataset(local_states_train)
+    if np.sum(my >= 0.5) <= 0:
+        raise RuntimeError("local escalation labels collapsed to zero positives; inspect sampling policy or threshold")
     micro = train_micro_detector(mx, my, device=cfg.device)
 
     if len(mx) > 0:
@@ -1439,8 +1513,17 @@ def main() -> None:
 
     local_thresholds = calibrate_local_thresholds(micro, mx, my, mb, device=cfg.device)
     local_eval = evaluate_local_detector(micro, mx, my, mb, local_thresholds, cfg)
+    local_eval["micro_target_definition"] = "global_vs_local_power_ratio"
+    escalation_gain_ratio_all = np.asarray([s["escalation_gain_ratio"] for s in local_states], dtype=float) if local_states else np.asarray([], dtype=float)
+    local_eval["mean_escalation_gain_ratio"] = float(np.mean(escalation_gain_ratio_all)) if len(escalation_gain_ratio_all) else 0.0
+    local_eval["p95_escalation_gain_ratio"] = float(np.percentile(escalation_gain_ratio_all, 95)) if len(escalation_gain_ratio_all) else 0.0
+    local_eval["positive_escalation_rate_train"] = float(np.mean([s["y"] for s in local_states_train])) if local_states_train else 0.0
+    local_eval["positive_escalation_rate_val"] = float(np.mean([s["y"] for s in local_states_val])) if local_states_val else 0.0
+    local_eval["positive_escalation_rate_test"] = float(np.mean([s["y"] for s in local_states_test])) if local_states_test else 0.0
 
     subsets = _subset_indices(prep)
+    assert np.all(np.isin(prep["source_domain"][subsets["true_multipeak_exp_test"]], ["experimental", "exp"])) if len(subsets["true_multipeak_exp_test"]) else True
+    assert np.all(np.isin(prep["source_domain"][subsets["true_multipeak_sim_benchmark"]], ["simulation", "sim"])) if len(subsets["true_multipeak_sim_benchmark"]) else True
 
     reports: Dict[str, Dict[str, Any]] = {}
     for name in ["nonshaded_test", "folder_labeled_shaded_test", "true_multipeak_test", "dynamic_transition_test"]:
@@ -1534,6 +1617,7 @@ def main() -> None:
     print("candidate_generation_mode: single_vmpp_prior_deterministic_verification")
     print("candidate_scores_are_model_predicted: False")
     print("candidate_fields_are_learned: False")
+    print("production_prior_is_normalized: True")
     print(f"production_loss_mode: {cfg.production_loss_mode}")
     print("certifiable_control_path: deterministic_refine_plus_fallback")
     print("ml_role: advisory_shade_detection_and_single_vmpp_prior")
@@ -1550,6 +1634,8 @@ def main() -> None:
     print(f"exp_calibration_count: {len(exp_split['val'])}")
     print(f"exp_test_count: {len(exp_split['test'])}")
     print(f"uncertainty_scale: {unc_cal['scale']}")
+    print(f"vhat_norm_mean: {vhat_norm_mean}")
+    print(f"vhat_norm_std: {vhat_norm_std}")
 
     _print_block("non-shaded no-harm metrics", reports["nonshaded_test"]["metrics"])
     print(f"nonshaded_delta_vs_baseline: {nonshaded_delta_vs_baseline}")
@@ -1567,7 +1653,7 @@ def main() -> None:
     print(f"true_multipeak_exp_test_count: {true_multipeak_exp_test_count}")
     print(f"true_multipeak_sim_benchmark_available: {true_multipeak_sim_benchmark_available}")
     print(f"true_multipeak_sim_benchmark_count: {true_multipeak_sim_benchmark_count}")
-    if true_multipeak_exp_test_count == 0:
+    if true_multipeak_exp_test_count == 0 and true_multipeak_sim_benchmark_count > 0:
         print("note: experimental true multi-peak held-out subset is empty; simulated benchmark used for multi-peak stress testing")
 
     print("\n[Local detector production gate]")
@@ -1578,6 +1664,12 @@ def main() -> None:
     print(f"local_detector_metrics_by_center_band: {local_eval['local_detector_metrics_by_center_band']}")
     print(f"local_track_false_trigger_rate_non_escalation: {local_eval['false_trigger_rate_non_escalation']}")
     print(f"local_track_escalation_recall: {local_eval['escalation_recall']}")
+    print(f"micro_target_definition: {local_eval['micro_target_definition']}")
+    print(f"mean_escalation_gain_ratio: {local_eval['mean_escalation_gain_ratio']}")
+    print(f"p95_escalation_gain_ratio: {local_eval['p95_escalation_gain_ratio']}")
+    print(f"positive_escalation_rate_train: {local_eval['positive_escalation_rate_train']}")
+    print(f"positive_escalation_rate_val: {local_eval['positive_escalation_rate_val']}")
+    print(f"positive_escalation_rate_test: {local_eval['positive_escalation_rate_test']}")
 
     print("\n[Coarse shade head]")
     print(f"shade_threshold: {shade_thr}")
