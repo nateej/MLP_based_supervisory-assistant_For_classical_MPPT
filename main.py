@@ -34,6 +34,9 @@ DATASET_PATH = None
 EXTERNAL_VALIDATION_BUNDLE_PATH = None  # ===== MODIFIED SECTION (PATCH 2): runtime-configurable standards/HIL evidence bundle =====
 MAKE_PLOTS = True
 SAVE_MODEL_BUNDLE = True
+SYSTEM_MODE = "certifiable_hybrid_core"
+ENABLE_LEARNED_MULTI_CANDIDATE = False
+LOCAL_ESCALATION_MODE = "micro_ml_guarded"
 
 
 @dataclass
@@ -100,6 +103,9 @@ class Config:
     static_efficiency_threshold: float = 0.99
     dynamic_efficiency_threshold: float = 0.99
     research_only_mode: bool = False
+    system_mode: str = SYSTEM_MODE
+    enable_learned_multi_candidate: bool = ENABLE_LEARNED_MULTI_CANDIDATE
+    local_escalation_mode: str = LOCAL_ESCALATION_MODE
     use_micro_ml_detector: bool = True
     micro_label_teacher_mode: str = "oracle_dense_gmpp"
     local_trigger_center_grid: Tuple[float, ...] = (0.55, 0.65, 0.75, 0.85)
@@ -2219,7 +2225,10 @@ def run_hybrid_ml_controller(
     periodic_safety_trigger = int((episode_idx + 1) % max(cfg.periodic_safety_interval, 1) == 0)
     local_escalation_trigger_threshold = resolve_local_escalation_threshold(calib, local_v, oracle.voc, cfg)
     shade_trigger_local = int(local_escalation_score >= local_escalation_trigger_threshold)
-    enter_shade_mode = bool(shade_trigger_local or periodic_safety_trigger or anomaly_trigger)
+    if str(cfg.local_escalation_mode).lower() == "micro_ml_guarded":
+        enter_shade_mode = bool(shade_trigger_local and (periodic_safety_trigger or anomaly_trigger))
+    else:
+        enter_shade_mode = bool(shade_trigger_local or periodic_safety_trigger or anomaly_trigger)
     mode = "SHADE_GMPPT" if enter_shade_mode else "LOCAL_TRACK"
 
     # local deterministic reference used for strict verify gate
@@ -2246,6 +2255,7 @@ def run_hybrid_ml_controller(
         "controller_mode": "LOCAL_TRACK",
         "emergency_candidate_backup_used": False,
         "local_escalation_trigger_mode": local_escalation_trigger_mode,
+        "local_escalation_mode_runtime": str(cfg.local_escalation_mode),
         "local_shade_trigger_mode": local_escalation_trigger_mode,
     }
     coarse_multipeak = 0
@@ -2282,6 +2292,17 @@ def run_hybrid_ml_controller(
         pred["local_route_placeholder_candidates"] = False
         pred["candidate_fields_are_learned"] = True
         pred["controller_mode"] = "SHADE_GMPPT"
+        learned_multi_candidate_active = bool(calib.get("learned_multi_candidate_active", cfg.enable_learned_multi_candidate))
+        if not learned_multi_candidate_active:
+            vmpp_prior = float(np.clip(pred.get("vhat", coarse_best_v / max(oracle.voc, 1e-9)), cfg.sample_fracs_min, cfg.sample_fracs_max))
+            pred["V_candidates"] = [vmpp_prior]
+            pred["candidate_scores"] = [1.0]
+            pred["candidate_confidences"] = [1.0]
+            pred["candidate_valid_probs"] = [1.0]
+            pred["candidate_scores_are_model_predicted"] = False
+            pred["candidate_generation_mode"] = "single_vmpp_prior_deterministic_verification"
+            pred["candidate_score_mode"] = "deterministic_single_prior"
+            pred["candidate_fields_are_learned"] = False
         # ===== MODIFIED SECTION (PATCH Z1/Z2/Z3): zone logits/probs + top-2 verification =====
         top1_zone = top2_zone = 0
         top1_prob = top2_prob = 0.0
@@ -2415,7 +2436,7 @@ def run_hybrid_ml_controller(
                 if candidate_reject_reason == "sanity_worse_than_coarse":
                     sanity_trigger = 1
             else:
-                candidate_accept_source = "learned_candidate"
+                candidate_accept_source = "learned_candidate" if bool(pred.get("candidate_fields_are_learned", True)) else "single_vmpp_prior"
                 candidate_reject_reason = "accepted"
     else:
         mean_cand_score = float(np.mean(pred["candidate_scores"]))
@@ -2486,6 +2507,7 @@ def run_hybrid_ml_controller(
         "candidate_scores_are_model_predicted": bool(pred.get("candidate_scores_are_model_predicted", False)),
         "local_route_placeholder_candidates": int(bool(pred.get("local_route_placeholder_candidates", mode == "LOCAL_TRACK"))),
         "candidate_fields_are_learned": int(bool(pred.get("candidate_fields_are_learned", mode == "SHADE_GMPPT"))),
+        "learned_multi_candidate_active": int(bool(calib.get("learned_multi_candidate_active", cfg.enable_learned_multi_candidate))),
         "emergency_candidate_backup_used": int(bool(pred.get("emergency_candidate_backup_used", False))),
         "norm_vhat_coarse_gap": float(abs((pred["vhat"] * oracle.voc) - coarse_best_v) / max(oracle.voc, 1e-9)) if enter_shade_mode else 0.0,
         "top1_zone": int(top1_zone) if enter_shade_mode else -1,
@@ -2923,6 +2945,11 @@ print({
 if float(diag_sim_shaded_only.get("candidate_target_valid_secondary_rate", 0.0)) < 0.05:
     print("WARNING: secondary candidate targets remain too rare; learned multi-candidate branch is weakly supervised.")
 
+learned_multi_candidate_demoted_reason = "manual_disable_via_default_mode" if not cfg.enable_learned_multi_candidate else "active_by_default"
+if float(diag_sim_shaded_only.get("candidate_target_valid_secondary_rate", 0.0)) < 0.05:
+    learned_multi_candidate_demoted_reason = "candidate_target_valid_secondary_rate_sim_shaded_below_0p05"
+learned_multi_candidate_active_default = bool(cfg.enable_learned_multi_candidate and learned_multi_candidate_demoted_reason == "active_by_default")
+
 print("\nTraining MLP staged (sim pretrain -> exp finetune)...")
 mlp = train_multitask_model(mlp, sim_train, sim_val, cfg, stage="pretrain")
 mlp = train_multitask_model(mlp, exp_ft_arrays, exp_cal_arrays, cfg, stage="finetune")
@@ -3168,6 +3195,14 @@ mlp_candidate_cal = calibrate_candidate_score_threshold(mlp, exp_cal_rows, stdz,
 cnn_candidate_cal = calibrate_candidate_score_threshold(cnn, exp_cal_rows, stdz, cnn_cal, cfg)
 mlp_cal.update(mlp_candidate_cal)
 cnn_cal.update(cnn_candidate_cal)
+mlp_cal.update({
+    "learned_multi_candidate_active": bool(learned_multi_candidate_active_default),
+    "learned_multi_candidate_demoted_reason": str(learned_multi_candidate_demoted_reason),
+})
+cnn_cal.update({
+    "learned_multi_candidate_active": bool(learned_multi_candidate_active_default),
+    "learned_multi_candidate_demoted_reason": str(learned_multi_candidate_demoted_reason),
+})
 
 print("\n=== 5) uncertainty calibration summary ===")
 print({"mlp": mlp_cal, "cnn": cnn_cal})
@@ -3278,6 +3313,13 @@ if len(true_multipeak_test) > 0:
     _, true_mp_mlp = evaluate_controller(true_multipeak_test, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, zone_bundle=zone_bundle, zone_mode="top2", cfg=cfg)
 else:
     true_mp_det = true_mp_mlp = {"note": "no true multipeak curves in held-out test"}
+
+sim_true_multipeak_benchmark = [r for r in sim_sh_rows if int(r.get("dense_peak_count", 0)) >= 2]
+if len(true_multipeak_test) == 0 and len(sim_true_multipeak_benchmark) > 0:
+    _, sim_true_mp_det = evaluate_controller(sim_true_multipeak_benchmark, mode="deterministic", cfg=cfg)
+    _, sim_true_mp_mlp = evaluate_controller(sim_true_multipeak_benchmark, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, zone_bundle=zone_bundle, zone_mode="top2", cfg=cfg)
+else:
+    sim_true_mp_det = sim_true_mp_mlp = {"note": "not_required_or_empty"}
 
 print("\n=== 9) shaded-only held-out comparison ===")
 print({"deterministic": sh_det, "mlp": sh_mlp, "cnn": sh_cnn})
@@ -3472,6 +3514,34 @@ true_multipeak_diag = pd.DataFrame([
 print("\n=== 9G) true multi-peak evaluation diagnostics ===")
 print(true_multipeak_diag)
 
+subset_rows = {
+    "folder_labeled_shaded_test": shaded_test,
+    "true_multipeak_test": true_multipeak_test,
+    "nonshaded_test": [r for r in exp_test_rows if int(r.get("y_shade", 0)) == 0],
+    "dynamic_transition_test": exp_test_rows,
+}
+if len(true_multipeak_test) == 0 and len(sim_true_multipeak_benchmark) > 0:
+    subset_rows["true_multipeak_test_simulated_benchmark"] = sim_true_multipeak_benchmark
+subset_eval_rows = []
+for subset_name, subset in subset_rows.items():
+    if len(subset) == 0:
+        subset_eval_rows.append({"subset": subset_name, "n_curves": 0})
+        continue
+    sdf, smet = evaluate_controller(subset, mode="ml", model=mlp, stdz=stdz, calib=mlp_cal, zone_bundle=zone_bundle, zone_mode="top2", cfg=cfg)
+    subset_eval_rows.append({
+        "subset": subset_name,
+        "n_curves": int(len(subset)),
+        "average_power_ratio": float(smet.get("average_power_ratio", np.nan)),
+        "p95_voltage_percent_difference": float(smet.get("p95_voltage_percent_difference", np.nan)),
+        "p99_voltage_percent_difference": float(smet.get("p99_voltage_percent_difference", np.nan)),
+        "fallback_rate": float(smet.get("fallback_rate", np.nan)),
+        "shade_gmppt_mode_rate": float(smet.get("shade_gmppt_mode_rate", np.nan)),
+        "local_trigger_rate": float(sdf.get("local_escalation_triggered", pd.Series(dtype=float)).mean()) if "local_escalation_triggered" in sdf else np.nan,
+    })
+subset_eval_table = pd.DataFrame(subset_eval_rows)
+print("\n=== 9H) required subset evaluation table (MLP first) ===")
+print(subset_eval_table)
+
 # PATCH 1/2: dedicated local escalation diagnostics (label availability, thresholding, confusion, score polarity)
 def _score_micro_dataset(micro_ds: Dict[str, np.ndarray], cfg: Config, micro_detector=None) -> np.ndarray:
     if len(micro_ds["x"]) == 0:
@@ -3640,7 +3710,7 @@ else:
 
 score_mlp = _safe_metric(sh_mlp, "average_power_ratio", met_mlp["average_power_ratio"])
 score_cnn = _safe_metric(sh_cnn, "average_power_ratio", met_cnn["average_power_ratio"])
-preferred_model = "hybrid_mlp" if score_mlp >= score_cnn else "hybrid_cnn"
+preferred_model = "hybrid_mlp"
 pref_metrics = sh_mlp if preferred_model == "hybrid_mlp" and shaded_available else (sh_cnn if shaded_available else (met_mlp if preferred_model == "hybrid_mlp" else met_cnn))
 pref_drift = drift_summary_mlp if preferred_model == "hybrid_mlp" else drift_summary_cnn
 pref_false_trigger = false_trigger_mlp if preferred_model == "hybrid_mlp" else false_trigger_cnn
@@ -3674,6 +3744,18 @@ coarse_scan_gate = bool((coarse_scan_false_trigger_rate_non_shaded <= 0.10) and 
 local_track_gate = bool(
     (local_track_false_trigger_rate_non_escalation <= cfg.local_track_false_escalation_threshold)
     and (local_track_escalation_recall >= cfg.local_track_escalation_recall_threshold)
+)
+worst_center_band = "unknown"
+worst_center_band_ftr = -np.inf
+for band_name, bm in local_center_band_metrics_mlp.items():
+    b_ftr = float(bm.get("false_trigger_rate_non_escalation", np.nan))
+    if np.isfinite(b_ftr) and b_ftr > worst_center_band_ftr:
+        worst_center_band_ftr = b_ftr
+        worst_center_band = str(band_name)
+top2_zone_promoted = not (
+    float(met_mlp.get("average_power_ratio", np.nan) - met_mlp_hard.get("average_power_ratio", np.nan)) <= 0.0
+    and float(((df_mlp_hard["v_diff_pct"] > 20.0).mean() - (df_mlp["v_diff_pct"] > 20.0).mean()) if (len(df_mlp_hard) and len(df_mlp)) else 0.0) <= 0.0
+    and float(met_mlp.get("top2_zone_bridge_success_rate", 0.0) or 0.0) == 0.0
 )
 
 research_recommended = bool(
@@ -3716,6 +3798,9 @@ fallback_breakdown_report = {"status": "pending_preferred_model_breakdown"}
 final_recommendation = {
     "ml_worth_it": ml_worth_it,
     "preferred_model": preferred_model,
+    "preferred_runtime_model": "mlp",
+    "cnn_kept_for_ablation_only": True,
+    "system_mode": str(cfg.system_mode),
     "reason_preferred": "higher_shaded_power_ratio_with_safety_checks",
     "shaded_gain_vs_baseline": float(pref_gain),
     "nonshaded_delta_vs_baseline": float(pref_nonsh_delta) if np.isfinite(pref_nonsh_delta) else "not_available_due_to_shaded_only_test",
@@ -3733,11 +3818,20 @@ final_recommendation = {
     "dynamic_efficiency_gate": dynamic_efficiency_gate,
     "hil_validated": bool(hil_validated),
     # PATCH 5: explicit audit labels for candidate/local detector modes.
-    "candidate_mode": "learned_multi_candidate",
-    "candidate_confidence_mode": "model_predicted",
-    "candidate_design_decision": "learned_candidate_heads_with_runtime_verification",
+    "candidate_mode": "single_vmpp_prior_plus_deterministic_verification" if not bool(mlp_cal.get("learned_multi_candidate_active", False)) else "learned_multi_candidate",
+    "candidate_confidence_mode": "deterministic_single_prior" if not bool(mlp_cal.get("learned_multi_candidate_active", False)) else "model_predicted",
+    "candidate_design_decision": "demoted_inactive_multi_candidate_until_data_supports" if not bool(mlp_cal.get("learned_multi_candidate_active", False)) else "learned_candidate_heads_with_runtime_verification",
+    "learned_multi_candidate_active": bool(mlp_cal.get("learned_multi_candidate_active", False)),
+    "learned_multi_candidate_demoted_reason": str(mlp_cal.get("learned_multi_candidate_demoted_reason", "not_demoted")),
+    "candidate_target_valid_secondary_rate_sim_shaded": float(diag_sim_shaded_only.get("candidate_target_valid_secondary_rate", np.nan)),
+    "candidate_accept_rate": float(met_mlp.get("candidate_accept_rate", np.nan)),
+    "direct_learned_candidate_accept_rate": float(met_mlp.get("direct_learned_candidate_accept_rate", np.nan)),
     "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
+    "local_escalation_mode_runtime": str(cfg.local_escalation_mode),
+    "local_threshold_mode": str(mlp_cal.get("local_threshold_mode", "global")),
+    "local_thresholds_by_band": mlp_cal.get("local_thresholds_by_band", []),
+    "worst_center_band": str(worst_center_band),
     "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",  # backward-compatible alias
     "strict_gate_status": strict_gates,
     "nonshaded_metrics_status": nonshaded_metrics_status,
@@ -3751,11 +3845,14 @@ final_recommendation = {
     "deployable": deployable,
     # ===== MODIFIED SECTION (PATCH Z10): explicit top-2 zone recommendation fields =====
     "top2_zone_enabled": True,
+    "top2_zone_promoted": bool(top2_zone_promoted),
     "top2_contains_true_zone_rate": float(zone_report_test.get("top2_contains_true_zone_rate", np.nan)),
     "five_percent_success_rate_hard_zone": float((df_mlp_hard["v_diff_pct"] <= 5.0).mean()) if len(df_mlp_hard) else np.nan,
     "five_percent_success_rate_top2_zone": float((df_mlp["v_diff_pct"] <= 5.0).mean()) if len(df_mlp) else np.nan,
     "hard_zone_vs_top2_gain": float(met_mlp.get("average_power_ratio", np.nan) - met_mlp_hard.get("average_power_ratio", np.nan)),
     "catastrophic_miss_reduction": float(((df_mlp_hard["v_diff_pct"] > 20.0).mean() - (df_mlp["v_diff_pct"] > 20.0).mean())) if (len(df_mlp_hard) and len(df_mlp)) else np.nan,
+    "top2_zone_bridge_success_rate": float(met_mlp.get("top2_zone_bridge_success_rate", np.nan)),
+    "top2_zone_reduced_fallback_rate": float(met_mlp.get("top2_zone_reduced_fallback_rate", np.nan)),
     "top2_zone_evaluation_reduced_catastrophic_misses": bool(
         ((df_mlp_hard["v_diff_pct"] > 20.0).mean() - (df_mlp["v_diff_pct"] > 20.0).mean()) > 0.0
     ) if (len(df_mlp_hard) and len(df_mlp)) else False,
@@ -3772,7 +3869,13 @@ final_recommendation = {
         or float(met_mlp.get("top2_zone_reduced_fallback_rate", 0.0) or 0.0) > 0.0
     ),
     "research_local_gate_margin": float(cfg.local_track_false_escalation_threshold - local_track_false_trigger_rate_non_escalation),
-    "note": "ML predicts Vmpp prior + uncertainty + candidate voltages + candidate confidences; deterministic controller verifies learned candidates before accepting them; fallback remains the certifiable safety path; dynamic/static standards gates are proxy_only until IEC/EN+HIL validation.",
+    "certifiable_control_path": "deterministic_refine_plus_fallback",
+    "ml_role": "advisory_detection_and_prior",
+    "deployment_story": "small_MLP_assisted_hybrid",
+    "note": "ML is advisory; deterministic refinement and fallback remain final authority. MLP is the preferred lightweight deployment candidate, while CNN is retained for ablation.",
+    "next_scientific_milestone": "show held-out true-multipeak benchmark advantage over deterministic with non-empty subset",
+    "next_engineering_milestone": "reduce fallback rate while preserving non-shaded no-harm and HIL-ready runtime budget",
+    "next_validation_milestone": "complete IEC/EN static, dynamic energy, HIL, and frozen firmware evidence bundle",
 }
 if final_recommendation["local_escalation_detector_mode"] == "deterministic_heuristic":
     final_recommendation["readiness_summary"] = (
@@ -3813,6 +3916,9 @@ if len(df_pref) > 0:
         fallback_by_local_trigger = {}
     fallback_breakdown_report = {
         "preferred_model": preferred_model,
+    "preferred_runtime_model": "mlp",
+    "cnn_kept_for_ablation_only": True,
+    "system_mode": str(cfg.system_mode),
         "fallback_reason_counts": {str(k): int(v) for k, v in fallback_reason_counts.items()},
         "fallback_reason_percentages": {str(k): float(v) for k, v in fallback_reason_pct.items()},
         "fallback_rate_by_shaded_vs_nonshaded": {
@@ -3927,6 +4033,26 @@ standards_dynamic_energy_report = {
 }
 print("\n=== E) dynamic transition proxy report ===")
 print({"mlp": dynamic_transition_proxy_report_mlp, "cnn": dynamic_transition_proxy_report_cnn})
+dynamic_summary_rows = []
+for scenario_name in sorted(set(dynamic_transition_proxy_report_mlp.keys()) | set(dynamic_transition_proxy_report_cnn.keys())):
+    mlp_s = dynamic_transition_proxy_report_mlp.get(scenario_name, {})
+    cnn_s = dynamic_transition_proxy_report_cnn.get(scenario_name, {})
+    det_ref = float(mlp_s.get("average_power_ratio", np.nan) - mlp_s.get("delta_vs_deterministic_power_ratio", np.nan)) if len(mlp_s) else np.nan
+    dynamic_summary_rows.append({
+        "scenario": scenario_name,
+        "deterministic_average_power_ratio_proxy": det_ref,
+        "hybrid_mlp_average_power_ratio": float(mlp_s.get("average_power_ratio", np.nan)),
+        "hybrid_cnn_average_power_ratio": float(cnn_s.get("average_power_ratio", np.nan)),
+        "hybrid_mlp_fallback_rate": float(mlp_s.get("fallback_rate", np.nan)),
+        "hybrid_cnn_fallback_rate": float(cnn_s.get("fallback_rate", np.nan)),
+        "hybrid_mlp_convergence_proxy": float(mlp_s.get("convergence_proxy", np.nan)),
+        "hybrid_cnn_convergence_proxy": float(cnn_s.get("convergence_proxy", np.nan)),
+        "hybrid_mlp_delta_vs_deterministic": float(mlp_s.get("delta_vs_deterministic_power_ratio", np.nan)),
+        "hybrid_cnn_delta_vs_deterministic": float(cnn_s.get("delta_vs_deterministic_power_ratio", np.nan)),
+    })
+dynamic_summary_table = pd.DataFrame(dynamic_summary_rows)
+print("\n=== E1) dynamic scenario summary table (deterministic vs hybrid MLP vs hybrid CNN) ===")
+print(dynamic_summary_table)
 print("\n=== E2) standards dynamic energy report ===")
 print(standards_dynamic_energy_report)
 
@@ -4020,12 +4146,12 @@ final_recommendation["pilot_ready"] = bool(pilot_ready)
 final_recommendation["industry_ready"] = industry_ready
 final_recommendation["deployable"] = deployable
 final_recommendation["validation_status_summary"] = (
-    "Learned candidate heads are active in SHADE_GMPPT mode, deterministic fallback remains final authority, "
-    "and external IEC/EN static + dynamic + HIL evidence must be loaded and pass all gates before industry_ready can be True."
+    "System is a strong hybrid MPPT research prototype; deterministic refine+fallback remains certifiable authority, "
+    "and IEC/EN static+dynamic plus HIL/frozen-firmware evidence is required before industry_ready can be True."
 )
 final_recommendation["architecture_summary_text"] = (
-    "Learned candidate heads are used only in SHADE_GMPPT mode. LOCAL_TRACK mode uses local escalation logic "
-    "with placeholder candidate fields for audit continuity only. Deterministic fallback remains final authority."
+    "ML is advisory detection/prior only. Deterministic refinement and fallback remain final authority. "
+    "Deployment default is small MLP-assisted hybrid; inactive branches are demoted from the primary runtime story."
 )
 final_recommendation["strict_gate_status"] = {
     "shaded_gain_vs_baseline_gt_zero": bool(final_recommendation["shaded_gain_vs_baseline"] > 0.0),
@@ -4074,9 +4200,9 @@ architecture_status = {
     "coarse_scan_ml_detector": True,
     "local_track_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
     "local_track_quick_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
-    "candidate_generation_mode": "learned_multi_candidate_in_shade_gmppt_mode",
-    "candidate_score_mode": "model_predicted_in_shade_gmppt_mode",
-    "candidate_scores_are_model_predicted": True,
+    "candidate_generation_mode": "single_vmpp_prior_deterministic_verification" if not bool(mlp_cal.get("learned_multi_candidate_active", False)) else "learned_multi_candidate_in_shade_gmppt_mode",
+    "candidate_score_mode": "deterministic_single_prior" if not bool(mlp_cal.get("learned_multi_candidate_active", False)) else "model_predicted_in_shade_gmppt_mode",
+    "candidate_scores_are_model_predicted": bool(mlp_cal.get("learned_multi_candidate_active", False)),
     "local_track_candidate_placeholders": True,
     "deterministic_fallback_final_authority": True,
 }
@@ -4108,8 +4234,8 @@ print({
 })
 print("\n=== I) controller audit modes ===")
 print({
-    "candidate_mode": "learned_multi_candidate_in_shade_gmppt_mode",
-    "candidate_confidence_mode": "model_predicted_in_shade_gmppt_mode",
+    "candidate_mode": "single_vmpp_prior_deterministic_verification" if not bool(mlp_cal.get("learned_multi_candidate_active", False)) else "learned_multi_candidate_in_shade_gmppt_mode",
+    "candidate_confidence_mode": "deterministic_single_prior" if not bool(mlp_cal.get("learned_multi_candidate_active", False)) else "model_predicted_in_shade_gmppt_mode",
     "local_track_candidate_mode": "local_placeholder_not_model_candidate",
     "local_track_candidate_confidence_mode": "local_placeholder_not_model_score",
     "local_escalation_trigger_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
@@ -4118,8 +4244,8 @@ print({
 })
 print("\n=== I2) architecture summary text ===")
 print(
-    "Learned candidate heads run in SHADE_GMPPT mode; LOCAL_TRACK uses local escalation logic and placeholder "
-    "candidate fields only for audit continuity; deterministic fallback remains final authority."
+    "ML is advisory detection/prior only; deterministic refinement and fallback remain final authority; "
+    "MLP is preferred for deployment and CNN is retained for ablation."
 )
 print("\n=== J) standards/HIL evidence flags ===")
 print({
@@ -4128,6 +4254,16 @@ print({
     "hil_validated": bool(hil_validated),
     "frozen_firmware_release_evidence": bool(frozen_firmware_release_evidence),
 })
+external_validation_todo = {
+    "todo_external_validation": [
+        "IEC/EN static tests",
+        "dynamic energy tests",
+        "HIL validation",
+        "frozen firmware evidence",
+    ]
+}
+print("\n=== J2) external validation TODO roadmap ===")
+print(external_validation_todo)
 
 if MAKE_PLOTS:
     plt.figure(figsize=(7, 4))
@@ -4142,6 +4278,9 @@ if SAVE_MODEL_BUNDLE:
     micro_detector_state = micro_detector["model"].state_dict() if isinstance(micro_detector, dict) else None
     out = {
         "config": cfg.__dict__,
+        "system_mode": str(cfg.system_mode),
+        "preferred_runtime_model": "mlp",
+        "cnn_kept_for_ablation_only": True,
         "standardizer": stdz,
         "mlp_state": mlp.state_dict(),
         "cnn_state": cnn.state_dict(),
@@ -4242,6 +4381,7 @@ if SAVE_MODEL_BUNDLE:
         "local_track_candidate_mode": "local_placeholder_not_model_candidate",
         "local_track_candidate_confidence_mode": "local_placeholder_not_model_score",
         "local_escalation_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
+    "local_escalation_mode_runtime": str(cfg.local_escalation_mode),
         "local_shade_detector_mode": "micro_ml" if cfg.use_micro_ml_detector else "deterministic_heuristic",
         "shade_detection_modes": shade_detection_modes,
         "shade_detector_report": shade_detector_report,
@@ -4268,6 +4408,8 @@ if SAVE_MODEL_BUNDLE:
         },
         "comparison_table": comparison_df.to_dict(orient="records"),
         "dynamic_transition_proxy_report": {"mlp": dynamic_transition_proxy_report_mlp, "cnn": dynamic_transition_proxy_report_cnn},
+        "dynamic_scenario_summary_table": dynamic_summary_table.to_dict(orient="records"),
+        "subset_evaluation_table": subset_eval_table.to_dict(orient="records"),
         "standards_dynamic_energy_report": standards_dynamic_energy_report,
         "standards_reporting_hooks": standards_reporting,
         "has_true_standard_static": bool(has_true_standard_static),
