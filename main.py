@@ -374,6 +374,9 @@ def extract_candidate_targets_from_dense_curve(v: np.ndarray, i: np.ndarray, cfg
             "y_cand_valid": zeros.copy(),
             "y_cand_rank_target": zeros.copy(),
             "y_num_candidates": np.int64(0),
+            "raw_peak_count": np.int64(0),
+            "filtered_peak_count": np.int64(0),
+            "secondary_peak_power_ratio": np.float32(0.0),
         }
     vd = np.linspace(0.0, voc, 600)
     idense = np.maximum(np.interp(vd, v, i), 0.0)
@@ -386,27 +389,31 @@ def extract_candidate_targets_from_dense_curve(v: np.ndarray, i: np.ndarray, cfg
             "y_cand_valid": zeros.copy(),
             "y_cand_rank_target": zeros.copy(),
             "y_num_candidates": np.int64(0),
+            "raw_peak_count": np.int64(0),
+            "filtered_peak_count": np.int64(0),
+            "secondary_peak_power_ratio": np.float32(0.0),
         }
 
-    peak_items = []
-    # ===== MODIFIED SECTION (PATCH 3): less-degenerate secondary target discovery =====
-    min_prom = float(max(0.50 * cfg.peak_prominence_ratio, 0.02) * pmax)
-    min_sep_v = float(max(0.85 * cfg.peak_min_separation_ratio, 0.05) * voc)
+    raw_peak_items = []
+    filtered_peak_items = []
+    min_prom = float(max(0.25 * cfg.peak_prominence_ratio, 0.01) * pmax)
+    min_sep_v = float(max(0.65 * cfg.peak_min_separation_ratio, 0.03) * voc)
     for k in range(1, len(pd) - 1):
         pk = float(pd[k])
         if not (pk > pd[k - 1] and pk >= pd[k + 1]):
             continue
+        raw_peak_items.append((float(vd[k]), pk))
         left = float(np.min(pd[max(0, k - 6):k + 1]))
         right = float(np.min(pd[k:min(len(pd), k + 7)]))
         prominence = pk - max(left, right)
         if prominence < min_prom:
             continue
-        if pk < float(max(0.65 * cfg.candidate_secondary_power_floor_ratio, 0.12) * pmax):
+        if pk < float(max(0.50 * cfg.candidate_secondary_power_floor_ratio, 0.08) * pmax):
             continue
-        peak_items.append((float(vd[k]), pk))
+        filtered_peak_items.append((float(vd[k]), pk))
 
     # keep strongest peaks while enforcing min voltage separation
-    peak_items = sorted(peak_items, key=lambda t: t[1], reverse=True)
+    peak_items = sorted(filtered_peak_items, key=lambda t: t[1], reverse=True)
     selected = []
     for vv, pp in peak_items:
         if all(abs(vv - sv) >= min_sep_v for sv, _ in selected):
@@ -419,8 +426,9 @@ def extract_candidate_targets_from_dense_curve(v: np.ndarray, i: np.ndarray, cfg
     gmpp_v = float(vd[gmpp_idx])
     gmpp_p = float(pd[gmpp_idx])
     secondary = None
+    secondary_floor = float(max(0.50 * cfg.candidate_secondary_power_floor_ratio, 0.08) * gmpp_p)
     for vv, pp in selected:
-        if abs(vv - gmpp_v) >= min_sep_v and pp >= float(max(0.65 * cfg.candidate_secondary_power_floor_ratio, 0.12) * gmpp_p):
+        if abs(vv - gmpp_v) >= min_sep_v and pp >= secondary_floor:
             secondary = (vv, pp)
             break
 
@@ -447,11 +455,15 @@ def extract_candidate_targets_from_dense_curve(v: np.ndarray, i: np.ndarray, cfg
     valid_rank_sum = float(np.sum(y_cand_rank_target * y_cand_valid))
     if valid_rank_sum > 0:
         y_cand_rank_target = (y_cand_rank_target / valid_rank_sum).astype(np.float32)
+    secondary_ratio = float(secondary[1] / max(gmpp_p, 1e-9)) if secondary is not None else 0.0
     return {
         "y_cand_v": y_cand_v.astype(np.float32),
         "y_cand_valid": y_cand_valid.astype(np.float32),
         "y_cand_rank_target": y_cand_rank_target.astype(np.float32),
         "y_num_candidates": np.int64(y_num_candidates),
+        "raw_peak_count": np.int64(len(raw_peak_items)),
+        "filtered_peak_count": np.int64(len(filtered_peak_items)),
+        "secondary_peak_power_ratio": np.float32(np.clip(secondary_ratio, 0.0, 1.5)),
     }
 
 
@@ -517,6 +529,9 @@ def extract_sparse_features(v: np.ndarray, i: np.ndarray, sample_fracs: np.ndarr
         "y_cand_valid": cand_targets["y_cand_valid"],
         "y_cand_rank_target": cand_targets["y_cand_rank_target"],
         "y_num_candidates": cand_targets["y_num_candidates"],
+        "raw_peak_count": cand_targets["raw_peak_count"],
+        "filtered_peak_count": cand_targets["filtered_peak_count"],
+        "secondary_peak_power_ratio": cand_targets["secondary_peak_power_ratio"],
     }
 
 
@@ -593,7 +608,7 @@ class MultiTaskMLP(nn.Module):
     def forward(self, x_flat, _x_scalar=None, _x_seq=None):
         h = self.backbone(x_flat)
         mean = torch.sigmoid(self.head_mean(h)).squeeze(-1)
-        logvar = self.head_logvar(h).squeeze(-1)
+        logvar = torch.clamp(self.head_logvar(h).squeeze(-1), min=-8.0, max=4.0)
         shade_logit = self.head_shade(h).squeeze(-1)
         cand_v = torch.sigmoid(self.candidate_voltage_head(h))
         cand_rank_logits = self.candidate_logit_head(h)
@@ -632,7 +647,7 @@ class TinyHybridCNN(nn.Module):
         hc = self.scalar_branch(x_scalar)
         h = self.fuse(torch.cat([hs, hc], dim=1))
         mean = torch.sigmoid(self.head_mean(h)).squeeze(-1)
-        logvar = self.head_logvar(h).squeeze(-1)
+        logvar = torch.clamp(self.head_logvar(h).squeeze(-1), min=-8.0, max=4.0)
         shade_logit = self.head_shade(h).squeeze(-1)
         cand_v = torch.sigmoid(self.candidate_voltage_head(h))
         cand_rank_logits = self.candidate_logit_head(h)
@@ -884,7 +899,8 @@ class DriftMonitor:
 # TRAINING / INFERENCE API
 # -------------------------
 def hetero_regression_loss(y, mu, logvar):
-    inv_var = torch.exp(-logvar)
+    logvar = torch.clamp(logvar, min=-8.0, max=4.0)
+    inv_var = torch.exp(-logvar).clamp(min=1e-4, max=1e4)
     return 0.5 * (logvar + (y - mu) ** 2 * inv_var)
 
 # ===== MODIFIED SECTION (PATCH 4): masked softmax distribution ranking loss =====
@@ -927,12 +943,15 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
     assert ycr_va.shape[1] == cfg.num_candidates, f"[{stage}] val y_cand_rank_target width {ycr_va.shape[1]} != cfg.num_candidates {cfg.num_candidates}"
 
     epochs = cfg.pretrain_epochs if stage == "pretrain" else cfg.finetune_epochs
-    lr = cfg.lr_pretrain if stage == "pretrain" else cfg.lr_finetune
+    lr = (3e-4 if (stage == "pretrain" and isinstance(model, MultiTaskMLP)) else (cfg.lr_pretrain if stage == "pretrain" else cfg.lr_finetune))
 
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=cfg.weight_decay)
 
     best = float("inf")
     best_state = None
+    best_epoch = 0
+    last_good_epoch = 0
+    divergence_detected = False
     patience = cfg.early_stop_patience
 
     for ep in range(1, epochs + 1):
@@ -971,6 +990,7 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
 
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
 
         model.eval()
@@ -998,17 +1018,27 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
             ).cpu())
 
         print(f"[{stage}] epoch {ep:03d} val_loss={vloss:.5f}")
+        if (not np.isfinite(vloss)) or (vloss > 20.0):
+            print(f"[{stage}] divergence detected at epoch {ep}, stopping early")
+            divergence_detected = True
+            break
         if vloss < best - 1e-6:
             best = vloss
+            best_epoch = int(ep)
+            last_good_epoch = int(ep)
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience = cfg.early_stop_patience
         else:
+            last_good_epoch = int(ep - 1) if ep > 1 else 0
             patience -= 1
             if patience <= 0:
                 break
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    model.pretrain_divergence_detected = bool(divergence_detected) if stage == "pretrain" else bool(getattr(model, "pretrain_divergence_detected", False))
+    model.pretrain_best_val_loss = float(best) if stage == "pretrain" else float(getattr(model, "pretrain_best_val_loss", np.nan))
+    model.pretrain_last_good_epoch = int(best_epoch if best_epoch > 0 else last_good_epoch) if stage == "pretrain" else int(getattr(model, "pretrain_last_good_epoch", 0))
     return model
 
 
@@ -1470,29 +1500,99 @@ def compute_shade_detector_metrics(y_true: np.ndarray, y_score: np.ndarray, thre
 
 
 def compute_local_escalation_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float) -> Dict[str, float]:
-    """Local detector metrics (escalation semantics only)."""
-    m = compute_binary_confusion_metrics(y_true, y_score, threshold)
-    cm = m["confusion_matrix"]
-    escalation_precision = float(m["precision"])
-    escalation_recall = float(m["recall"])
-    escalation_f1 = float(m["f1"])
-    escalation_bal_acc = float(m["balanced_accuracy"])
-    false_trigger_non_escalation = float(cm["fp"] / max(cm["fp"] + cm["tn"], 1))
-    missed_escalation_rate = float(cm["fn"] / max(cm["fn"] + cm["tp"], 1))
-    m.update({
-        "false_trigger_rate_non_escalation": false_trigger_non_escalation,
-        "missed_escalation_rate": missed_escalation_rate,
-        "escalation_precision": escalation_precision,
-        "escalation_recall": escalation_recall,
-        "escalation_f1": escalation_f1,
-        "escalation_balanced_accuracy": escalation_bal_acc,
-        # backward-compatible aliases
-        "precision": escalation_precision,
-        "recall": escalation_recall,
-        "f1": escalation_f1,
-        "balanced_accuracy": escalation_bal_acc,
-    })
-    return m
+    """Legacy wrapper: uses runtime-threshold helper in global-threshold mode."""
+    center_norm = np.zeros_like(np.asarray(y_score, dtype=float))
+    return compute_local_escalation_metrics_runtime_thresholds(
+        y_true=np.asarray(y_true, dtype=int),
+        y_score=np.asarray(y_score, dtype=float),
+        center_norm=center_norm,
+        cfg=cfg,
+        calib={"local_threshold_mode": "global", "micro_escalation_threshold": float(threshold)},
+    )
+
+
+def compute_local_escalation_metrics_runtime_thresholds(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    center_norm: np.ndarray,
+    cfg,
+    calib: Dict[str, float],
+) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=int)
+    y_score = np.asarray(y_score, dtype=float)
+    center_norm = np.asarray(center_norm, dtype=float)
+
+    preds = []
+    thresholds_used = []
+
+    for s, c in zip(y_score, center_norm):
+        if str(calib.get("local_threshold_mode", "global")) == "center_band":
+            th = None
+            for lo, hi, t in calib.get("local_thresholds_by_band", []):
+                if c >= float(lo) and c < float(hi):
+                    th = float(t)
+                    break
+            if th is None:
+                th = float(calib.get("micro_escalation_threshold", calib.get("local_escalation_threshold", cfg.local_shade_trigger_threshold)))
+        else:
+            th = float(calib.get("micro_escalation_threshold", calib.get("local_escalation_threshold", cfg.local_shade_trigger_threshold)))
+
+        thresholds_used.append(float(th))
+        preds.append(int(float(s) >= th))
+
+    y_hat = np.asarray(preds, dtype=int)
+    tp = int(np.sum((y_hat == 1) & (y_true == 1)))
+    fp = int(np.sum((y_hat == 1) & (y_true == 0)))
+    fn = int(np.sum((y_hat == 0) & (y_true == 1)))
+    tn = int(np.sum((y_hat == 0) & (y_true == 0)))
+
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+    tnr = tn / max(tn + fp, 1)
+    bal_acc = 0.5 * (recall + tnr)
+
+    return {
+        "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "balanced_accuracy": float(bal_acc),
+        "false_trigger_rate_non_escalation": float(fp / max(fp + tn, 1)),
+        "missed_escalation_rate": float(fn / max(fn + tp, 1)),
+        "escalation_precision": float(precision),
+        "escalation_recall": float(recall),
+        "escalation_f1": float(f1),
+        "escalation_balanced_accuracy": float(bal_acc),
+        "threshold_mode_used": str(calib.get("local_threshold_mode", "global")),
+        "avg_threshold_used": float(np.mean(thresholds_used)) if len(thresholds_used) else np.nan,
+    }
+
+
+def local_detector_metrics_by_center_band_runtime_thresholds(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    center_norm: np.ndarray,
+    cfg,
+    calib: Dict[str, float],
+):
+    bands = [(0.35, 0.55), (0.55, 0.65), (0.65, 0.75), (0.75, 0.90)]
+    out = {}
+    for lo, hi in bands:
+        mask = (center_norm >= lo) & (center_norm < hi)
+        key = f"{lo:.2f}-{hi:.2f}_voc"
+        if int(np.sum(mask)) == 0:
+            out[key] = {"n": 0, "note": "no samples in band"}
+            continue
+        m = compute_local_escalation_metrics_runtime_thresholds(
+            y_true[mask],
+            y_score[mask],
+            center_norm[mask],
+            cfg,
+            calib,
+        )
+        out[key] = {"n": int(np.sum(mask)), **m}
+    return out
 
 
 def summarize_local_state_labels(states: List[Dict], split_name: str) -> Dict[str, float]:
@@ -2443,18 +2543,24 @@ def prepare_experimental_splits(exp_ok_rows: List[Dict], exp_sh_rows: List[Dict]
 def candidate_target_diagnostics(rows: List[Dict]) -> Dict[str, float]:
     """PATCH 3: diagnostics to verify slot-2 candidate target is non-degenerate."""
     if len(rows) == 0:
-        return {"candidate_target_valid_secondary_rate": 0.0, "candidate_target_num_candidates_distribution": {}, "secondary_peak_power_ratio_histogram": {}}
+        return {
+            "raw_peak_count_distribution": {},
+            "filtered_peak_count_distribution": {},
+            "candidate_target_valid_secondary_rate": 0.0,
+            "candidate_target_num_candidates_distribution": {},
+            "secondary_peak_power_ratio_histogram": {},
+        }
     num_c = np.asarray([int(r.get("y_num_candidates", 0)) for r in rows], dtype=int)
     valid_secondary = np.asarray([int(np.asarray(r.get("y_cand_valid", [0, 0]), dtype=float)[1] > 0.5) for r in rows], dtype=int)
-    sec_ratio = []
-    for r in rows:
-        yc = np.asarray(r.get("y_cand_rank_target", [1.0, 0.0]), dtype=float)
-        if len(yc) > 1 and np.isfinite(yc[1]) and yc[1] > 0:
-            sec_ratio.append(float(yc[1]))
+    sec_ratio = [float(r.get("secondary_peak_power_ratio", 0.0)) for r in rows if np.isfinite(float(r.get("secondary_peak_power_ratio", 0.0)))]
+    raw_peak_count = np.asarray([int(r.get("raw_peak_count", 0)) for r in rows], dtype=int)
+    filtered_peak_count = np.asarray([int(r.get("filtered_peak_count", 0)) for r in rows], dtype=int)
     bins = [0.0, 0.25, 0.5, 0.75, 1.01]
     hist = np.histogram(np.asarray(sec_ratio, dtype=float), bins=bins)[0] if len(sec_ratio) else np.zeros((len(bins) - 1,), dtype=int)
     labels = [f"{bins[j]:.2f}-{bins[j+1]:.2f}" for j in range(len(bins) - 1)]
     return {
+        "raw_peak_count_distribution": {str(k): int(np.sum(raw_peak_count == k)) for k in sorted(np.unique(raw_peak_count))},
+        "filtered_peak_count_distribution": {str(k): int(np.sum(filtered_peak_count == k)) for k in sorted(np.unique(filtered_peak_count))},
         "candidate_target_valid_secondary_rate": float(np.mean(valid_secondary)),
         "candidate_target_num_candidates_distribution": {str(k): int(np.sum(num_c == k)) for k in sorted(np.unique(num_c))},
         "secondary_peak_power_ratio_histogram": {labels[j]: int(hist[j]) for j in range(len(labels))},
@@ -2776,11 +2882,18 @@ print({
     "exp_test": len(exp_test_rows),
 })
 print("\n=== 2B) candidate target diagnostics ===")
+diag_sim_all = candidate_target_diagnostics(sim_rows)
+diag_sim_shaded_only = candidate_target_diagnostics(sim_sh_rows)
+diag_exp_finetune = candidate_target_diagnostics(exp_ft_rows)
+diag_exp_test = candidate_target_diagnostics(exp_test_rows)
 print({
-    "sim": candidate_target_diagnostics(sim_rows),
-    "exp_finetune": candidate_target_diagnostics(exp_ft_rows),
-    "exp_test": candidate_target_diagnostics(exp_test_rows),
+    "sim_all": diag_sim_all,
+    "sim_shaded_only": diag_sim_shaded_only,
+    "exp_finetune": diag_exp_finetune,
+    "exp_test": diag_exp_test,
 })
+if float(diag_sim_shaded_only.get("candidate_target_valid_secondary_rate", 0.0)) < 0.05:
+    print("WARNING: secondary candidate targets remain too rare; learned multi-candidate branch is weakly supervised.")
 
 print("\nTraining MLP staged (sim pretrain -> exp finetune)...")
 mlp = train_multitask_model(mlp, sim_train, sim_val, cfg, stage="pretrain")
@@ -2972,9 +3085,8 @@ if len(micro_cal_ds["x"]):
         micro_cal_ds["y"],
         local_runtime_scores,
         np.asarray(micro_cal_ds["x"][:, 0], dtype=float),
-        local_escalation_cal,
         cfg,
-        float(local_escalation_cal.get("micro_escalation_threshold", local_escalation_cal.get("local_escalation_trigger_threshold", cfg.local_shade_trigger_threshold))),
+        local_escalation_cal,
     )
 else:
     local_runtime_detector_metrics = {
@@ -3031,6 +3143,19 @@ cnn_cal.update(cnn_candidate_cal)
 
 print("\n=== 5) uncertainty calibration summary ===")
 print({"mlp": mlp_cal, "cnn": cnn_cal})
+post_calibration_sanity = {
+    "runtime_threshold_local_eval_helper_defined": bool(callable(compute_local_escalation_metrics_runtime_thresholds)),
+    "local_threshold_mode": str(mlp_cal.get("local_threshold_mode", "global")),
+    "local_thresholds_by_band": mlp_cal.get("local_thresholds_by_band", []),
+    "candidate_target_valid_secondary_rate_sim": float(diag_sim_all.get("candidate_target_valid_secondary_rate", np.nan)),
+    "candidate_target_valid_secondary_rate_sim_shaded_only": float(diag_sim_shaded_only.get("candidate_target_valid_secondary_rate", np.nan)),
+    "candidate_target_valid_secondary_rate_exp_finetune": float(diag_exp_finetune.get("candidate_target_valid_secondary_rate", np.nan)),
+    "mlp_pretrain_divergence_detected": bool(getattr(mlp, "pretrain_divergence_detected", False)),
+    "mlp_pretrain_best_val_loss": float(getattr(mlp, "pretrain_best_val_loss", np.nan)),
+    "mlp_pretrain_last_good_epoch": int(getattr(mlp, "pretrain_last_good_epoch", 0)),
+}
+print("\n=== 5Y) post-calibration sanity summary ===")
+print(post_calibration_sanity)
 print("\n=== 5Z) zone analysis report ===")
 zone_analysis_report = {
     "zone_loss_mode": "distance_weighted_cross_entropy",
@@ -3144,7 +3269,7 @@ def evaluate_coarse_shade_head(model, arrays, cfg: Config):
     return ys.astype(int), probs
 
 
-def evaluate_local_detector(rows: List[Dict], cfg: Config, threshold: float, micro_detector=None):
+def evaluate_local_detector(rows: List[Dict], cfg: Config, threshold: float, micro_detector=None, calib: Optional[Dict[str, float]] = None):
     y_true = []
     y_score = []
     center_norm = []
@@ -3162,52 +3287,14 @@ def evaluate_local_detector(rows: List[Dict], cfg: Config, threshold: float, mic
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
     center_norm = np.asarray(center_norm, dtype=float)
-    metrics = compute_local_escalation_metrics(y_true, y_score, threshold)
+    metrics = compute_local_escalation_metrics_runtime_thresholds(
+        y_true,
+        y_score,
+        center_norm,
+        cfg,
+        calib if isinstance(calib, dict) else {"micro_escalation_threshold": float(threshold), "local_threshold_mode": "global"},
+    )
     return y_true, y_score, center_norm, metrics
-
-
-def _resolve_per_state_local_thresholds(center_norm: np.ndarray, calib: Dict[str, float], cfg: Config, default_threshold: float) -> np.ndarray:
-    mode = str(calib.get("local_threshold_mode", "global"))
-    if mode != "center_band":
-        return np.full((len(center_norm),), float(default_threshold), dtype=float)
-    thresholds = np.full((len(center_norm),), float(calib.get("micro_escalation_threshold", default_threshold)), dtype=float)
-    for lo, hi, th in calib.get("local_thresholds_by_band", []):
-        mask = (center_norm >= float(lo)) & (center_norm < float(hi))
-        thresholds[mask] = float(th)
-    return thresholds
-
-
-def compute_local_escalation_metrics_runtime_thresholds(y_true: np.ndarray, y_score: np.ndarray, center_norm: np.ndarray, calib: Dict[str, float], cfg: Config, default_threshold: float) -> Dict[str, float]:
-    y_t = np.asarray(y_true, dtype=int)
-    y_s = np.asarray(y_score, dtype=float)
-    ctr = np.asarray(center_norm, dtype=float)
-    th = _resolve_per_state_local_thresholds(ctr, calib, cfg, default_threshold)
-    y_h = (y_s >= th).astype(int)
-    tp = int(np.sum((y_h == 1) & (y_t == 1)))
-    fp = int(np.sum((y_h == 1) & (y_t == 0)))
-    fn = int(np.sum((y_h == 0) & (y_t == 1)))
-    tn = int(np.sum((y_h == 0) & (y_t == 0)))
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-9)
-    tnr = tn / max(tn + fp, 1)
-    bal_acc = 0.5 * (recall + tnr)
-    return {
-        "threshold_mode": str(calib.get("local_threshold_mode", "global")),
-        "threshold": float(np.mean(th)) if len(th) else float(default_threshold),
-        "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "balanced_accuracy": float(bal_acc),
-        "false_trigger_rate_non_escalation": float(fp / max(fp + tn, 1)),
-        "missed_escalation_rate": float(fn / max(fn + tp, 1)),
-        "escalation_precision": float(precision),
-        "escalation_recall": float(recall),
-        "escalation_f1": float(f1),
-        "escalation_balanced_accuracy": float(bal_acc),
-    }
-
 
 def summarize_score_distribution(y_true: np.ndarray, y_score: np.ndarray) -> Dict[str, Dict[str, float]]:
     def _stats(arr: np.ndarray) -> Dict[str, float]:
@@ -3224,31 +3311,6 @@ def summarize_score_distribution(y_true: np.ndarray, y_score: np.ndarray) -> Dic
     return {"positive_states": _stats(pos), "negative_states": _stats(neg)}
 
 
-def local_detector_metrics_by_center_band(y_true: np.ndarray, y_score: np.ndarray, center_norm: np.ndarray, threshold: float, calib: Optional[Dict[str, float]] = None, cfg: Config = cfg):
-    # ===== MODIFIED SECTION (PATCH 5): local detector stability across required operating regions =====
-    bands = [(0.35, 0.55), (0.55, 0.65), (0.65, 0.75), (0.75, 0.90)]
-    out = {}
-    for lo, hi in bands:
-        mask = (center_norm >= lo) & (center_norm < hi)
-        key = f"{lo:.2f}-{hi:.2f}_voc"
-        if int(np.sum(mask)) == 0:
-            out[key] = {"n": 0, "note": "no samples in band"}
-            continue
-        if isinstance(calib, dict):
-            m = compute_local_escalation_metrics_runtime_thresholds(y_true[mask], y_score[mask], center_norm[mask], calib, cfg, threshold)
-        else:
-            m = compute_local_escalation_metrics(y_true[mask], y_score[mask], threshold)
-        out[key] = {
-            "n": int(np.sum(mask)),
-            "escalation_precision": float(m["escalation_precision"]),
-            "escalation_recall": float(m["escalation_recall"]),
-            "escalation_f1": float(m["escalation_f1"]),
-            "escalation_balanced_accuracy": float(m["escalation_balanced_accuracy"]),
-            "false_trigger_rate_non_escalation": float(m["false_trigger_rate_non_escalation"]),
-        }
-    return out
-
-
 y_true_mlp, y_score_mlp = evaluate_coarse_shade_head(mlp, exp_test_arrays, cfg)
 y_true_cnn, y_score_cnn = evaluate_coarse_shade_head(cnn, exp_test_arrays, cfg)
 local_trigger_threshold_mlp = float(mlp_cal.get("local_escalation_trigger_threshold", mlp_cal.get("local_shade_trigger_threshold", cfg.local_shade_trigger_threshold)))
@@ -3260,23 +3322,24 @@ y_true_local, y_score_local, center_norm_local, local_metrics_mlp = evaluate_loc
     cfg,
     local_eval_threshold_mlp,
     micro_detector=mlp_cal.get("micro_detector", None) if cfg.use_micro_ml_detector else None,
+    calib=mlp_cal,
 )
 _y_true_local_cnn, _y_score_local_cnn, _center_norm_local_cnn, local_metrics_cnn = evaluate_local_detector(
     exp_test_rows,
     cfg,
     local_eval_threshold_cnn,
     micro_detector=cnn_cal.get("micro_detector", None) if cfg.use_micro_ml_detector else None,
+    calib=cnn_cal,
 )
-local_metrics_mlp = compute_local_escalation_metrics_runtime_thresholds(y_true_local, y_score_local, center_norm_local, mlp_cal, cfg, local_eval_threshold_mlp)
-local_metrics_cnn = compute_local_escalation_metrics_runtime_thresholds(_y_true_local_cnn, _y_score_local_cnn, _center_norm_local_cnn, cnn_cal, cfg, local_eval_threshold_cnn)
-local_center_band_metrics_mlp = local_detector_metrics_by_center_band(y_true_local, y_score_local, center_norm_local, local_eval_threshold_mlp, calib=mlp_cal, cfg=cfg)
-local_center_band_metrics_cnn = local_detector_metrics_by_center_band(
+local_metrics_mlp = compute_local_escalation_metrics_runtime_thresholds(y_true_local, y_score_local, center_norm_local, cfg, mlp_cal)
+local_metrics_cnn = compute_local_escalation_metrics_runtime_thresholds(_y_true_local_cnn, _y_score_local_cnn, _center_norm_local_cnn, cfg, cnn_cal)
+local_center_band_metrics_mlp = local_detector_metrics_by_center_band_runtime_thresholds(y_true_local, y_score_local, center_norm_local, cfg, mlp_cal)
+local_center_band_metrics_cnn = local_detector_metrics_by_center_band_runtime_thresholds(
     _y_true_local_cnn,
     _y_score_local_cnn,
     _center_norm_local_cnn,
-    local_eval_threshold_cnn,
-    calib=cnn_cal,
-    cfg=cfg,
+    cfg,
+    cnn_cal,
 )
 shade_detection_modes = {
     "coarse_scan_detector_mode": "ml_classifier",
@@ -3400,9 +3463,8 @@ local_test_metrics_diag = compute_local_escalation_metrics_runtime_thresholds(
     micro_test_ds["y"],
     local_scores_test,
     np.asarray(micro_test_ds["x"][:, 0], dtype=float) if len(micro_test_ds["x"]) else np.zeros((0,), dtype=float),
-    mlp_cal,
     cfg,
-    local_diag_threshold,
+    mlp_cal,
 ) if len(micro_test_ds["y"]) else {
     "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0}
 }
