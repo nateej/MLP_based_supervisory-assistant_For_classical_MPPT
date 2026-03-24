@@ -244,9 +244,16 @@ def extract_vi(curve: Any) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         i = _pick(curve, "i", "I", "current", "y")
 
     if v is None or i is None:
-        arr = np.asarray(curve, dtype=object)
-        if arr.ndim >= 1 and arr.size >= 2:
-            v, i = arr.reshape(-1)[:2]
+        arr = np.asarray(curve)
+        if arr.ndim == 2:
+            if arr.shape[1] >= 2:
+                return arr[:, 0].reshape(-1), arr[:, 1].reshape(-1)
+            if arr.shape[0] >= 2:
+                return arr[0, :].reshape(-1), arr[1, :].reshape(-1)
+
+        arr_obj = np.asarray(curve, dtype=object)
+        if arr_obj.ndim >= 1 and arr_obj.size >= 2:
+            v, i = arr_obj.reshape(-1)[:2]
 
     if v is None or i is None:
         return None
@@ -302,14 +309,18 @@ def _convert_grouped_curve_dataset_to_canonical(raw: Dict[str, Any]) -> Dict[str
                 total_skipped += 1
                 continue
             v, i = vi
+            v_clean, i_clean = clean_iv_curve(v, i)
+            if not validate_cleaned_curve(v_clean, i_clean):
+                total_skipped += 1
+                continue
             try:
-                mpp = compute_mpp_dense(v, i)
+                mpp = compute_mpp_dense(v_clean, i_clean)
                 vmpp_val = mpp["vmpp"] if isinstance(mpp, dict) else mpp[0]
             except Exception:
                 total_skipped += 1
                 continue
-            curves_v.append(v)
-            curves_i.append(i)
+            curves_v.append(v_clean)
+            curves_i.append(i_clean)
             vmpp_true.append(float(vmpp_val))
             labels_shaded.append(int(shade_label))
             source_domain.append(domain)
@@ -317,7 +328,7 @@ def _convert_grouped_curve_dataset_to_canonical(raw: Dict[str, Any]) -> Dict[str
             total_valid += 1
 
     print(
-        "Converted grouped dataset -> canonical format: "
+        "Converted grouped dataset -> canonical VALID format: "
         f"total_seen={total_seen}, total_valid={total_valid}, total_skipped={total_skipped}"
     )
     if total_valid == 0:
@@ -1235,7 +1246,8 @@ def _prepare_features(dataset: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     curves_i = np.asarray(dataset["curves_i"], dtype=object)
     y_vmpp = np.asarray(dataset["vmpp_true"]).astype(np.float32).reshape(-1)
     y_shade = np.asarray(dataset["labels_shaded"]).astype(np.float32).reshape(-1)
-    source_domain = np.asarray(dataset["source_domain"]).astype(str).reshape(-1)
+    source_domain = np.asarray(dataset["source_domain"], dtype=object).reshape(-1)
+    source_domain = np.array([str(x).strip().lower() for x in source_domain], dtype=object)
     dynamic_flags = np.asarray(dataset["dynamic_flags"]).astype(np.int32).reshape(-1)
 
     features: List[np.ndarray] = []
@@ -1261,13 +1273,37 @@ def _prepare_features(dataset: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     y_vmpp_norm = (y_vmpp / np.maximum(vocs, 1e-6)).astype(np.float32)
     y_vmpp_norm = np.clip(y_vmpp_norm, 0.0, 1.0)
 
-    sim_idx = np.where(valid_mask & np.isin(source_domain, ["simulation", "sim"]))[0]
+    sim_idx = np.where(valid_mask & np.isin(source_domain, ["simulation", "sim", "simulated"]))[0]
     exp_idx = np.where(valid_mask & np.isin(source_domain, ["experimental", "exp"]))[0]
+    n_valid_total = int(np.sum(valid_mask))
+    n_valid_sim = int(len(sim_idx))
+    n_valid_exp = int(len(exp_idx))
+    print(
+        {
+            "n_valid_total": n_valid_total,
+            "n_valid_sim": n_valid_sim,
+            "n_valid_exp": n_valid_exp,
+        }
+    )
+    if len(sim_idx) == 0:
+        raise RuntimeError(
+            "No valid simulation rows remained after grouped MAT conversion and feature validation. "
+            "Check extract_vi() and grouped dataset conversion."
+        )
+    if len(exp_idx) == 0:
+        raise RuntimeError(
+            "No valid experimental rows remained after grouped MAT conversion and feature validation. "
+            "Check extract_vi() and grouped dataset conversion."
+        )
     rng = np.random.default_rng(cfg.seed)
     rng.shuffle(sim_idx)
     rng.shuffle(exp_idx)
     sim_split = _safe_index_split(sim_idx, train=0.85, val=0.15)
     exp_split = _safe_index_split(exp_idx, train=0.70, val=0.15)
+    if len(sim_split["train"]) == 0:
+        raise RuntimeError("sim_split['train'] is empty after split; simulation domain parsing is still wrong.")
+    if len(exp_split["train"]) == 0:
+        raise RuntimeError("exp_split['train'] is empty after split; experimental domain parsing is still wrong.")
 
     stats = fit_standardizer(x[sim_split["train"]])
     x_std = apply_standardizer(x, stats).astype(np.float32)
@@ -1350,7 +1386,7 @@ def main() -> None:
     assert len(prep["exp_split"]["train"]) > 0, "exp_split['train'] is empty"
     assert len(prep["exp_split"]["val"]) > 0, "exp_split['val'] is empty"
     assert len(prep["exp_split"]["test"]) > 0, "exp_split['test'] is empty"
-    assert np.all(np.isin(prep["source_domain"][prep["sim_split"]["train"]], ["simulation", "sim"]))
+    assert np.all(np.isin(prep["source_domain"][prep["sim_split"]["train"]], ["simulation", "sim", "simulated"]))
     assert np.all(np.isin(prep["source_domain"][prep["exp_split"]["train"]], ["experimental", "exp"]))
     assert np.all(np.isin(prep["source_domain"][prep["exp_split"]["test"]], ["experimental", "exp"]))
 
