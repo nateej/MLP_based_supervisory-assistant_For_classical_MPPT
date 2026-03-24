@@ -89,7 +89,7 @@ class Config:
     peak_prominence_ratio: float = 0.06
     peak_min_separation_ratio: float = 0.08
     candidate_secondary_power_floor_ratio: float = 0.25
-    lambda_unc: float = 1.0
+    # NOTE: explicit uncertainty regularizer removed; heteroscedastic uncertainty is already trained via main_vmpp_loss.
     lambda_shade: float = 0.35
     lambda_cand_v: float = 0.75
     lambda_cand_rank: float = 0.35
@@ -955,7 +955,6 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
             ycr = torch.tensor(ycr_aug[b], device=cfg.device)
             mu, logvar, slogit, cand_v, cand_rank_logits, cand_valid_logits = model(xb, xs, xq)
             main_vmpp_loss = hetero_regression_loss(yb, mu, logvar).mean()
-            unc_loss = torch.zeros((), device=cfg.device)
             cls = F.binary_cross_entropy_with_logits(slogit, sb)
             cand_v_loss = (((cand_v - ycv) ** 2) * ycvd).sum() / torch.clamp(ycvd.sum(), min=1.0)
             cand_rank_loss = masked_softmax_rank_loss(cand_rank_logits, ycr, ycvd)
@@ -963,7 +962,6 @@ def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: s
             l2 = sum((p ** 2).sum() for p in model.parameters())
             loss = (
                 main_vmpp_loss
-                + cfg.lambda_unc * unc_loss
                 + cfg.lambda_shade * cls
                 + cfg.lambda_cand_v * cand_v_loss
                 + cfg.lambda_cand_rank * cand_rank_loss
@@ -1382,6 +1380,7 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
 
     rec_df = pd.DataFrame(records)
     best = None
+    sweep_rows = []
     base_fallback = float(rec_df["would_fallback"].mean())
     bad_accept_bound = 0.30
     for mode in ("mean", "max"):
@@ -1395,7 +1394,7 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
             bad_accept_given_accept = float(np.sum((accept == 1) & (y == 0)) / accepted)
             fallback_after_gate = float(np.mean((accept == 0).astype(int)))
             fallback_reduction = float(base_fallback - fallback_after_gate)
-            objective = useful_accept_rate + 0.35 * fallback_reduction - 0.50 * bad_accept_rate
+            objective = 1.25 * useful_accept_rate + 0.85 * fallback_reduction - 0.35 * bad_accept_rate
             if bad_accept_given_accept > bad_accept_bound:
                 objective -= 1.0
             item = {
@@ -1406,9 +1405,18 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
                 "bad_accept_rate": bad_accept_rate,
                 "fallback_reduction": fallback_reduction,
             }
+            sweep_rows.append(item)
             if (best is None) or (item["objective"] > best["objective"]):
                 best = item
-
+    sweep_rows = sorted(sweep_rows, key=lambda z: z["objective"], reverse=True)
+    print("\n[candidate_gate_calibration]")
+    print({
+        "selected_threshold": float(best["threshold"]),
+        "selected_gate_mode": str(best["mode"]),
+        "useful_accept_rate": float(best["useful_accept_rate"]),
+        "bad_accept_rate": float(best["bad_accept_rate"]),
+        "fallback_reduction": float(best["fallback_reduction"]),
+    })
     return {
         "candidate_conf_threshold_calibrated": best["threshold"],
         "learned_candidate_conf_threshold": best["threshold"],
@@ -1425,6 +1433,7 @@ def calibrate_candidate_score_threshold(model, rows_cal: List[Dict], stdz, calib
             "max_p50": float(np.quantile(rec_df["max_score"], 0.50)),
             "max_p90": float(np.quantile(rec_df["max_score"], 0.90)),
         },
+        "candidate_threshold_sweep_table": sweep_rows,
     }
 
 
@@ -1955,6 +1964,22 @@ def calibrate_micro_escalation_threshold(micro_detector, x_cal: np.ndarray, y_ca
             np.mean([bf <= cfg.local_track_false_escalation_threshold for bf in band_false]) >= 0.5
             and float(best["recall"]) >= cfg.local_track_escalation_recall_threshold
         )
+    # If false-trigger is still high, force stricter threshold in worst offending center band.
+    if out.get("local_threshold_mode", "global") == "center_band":
+        adjusted = []
+        for lo, hi, th in out.get("local_thresholds_by_band", []):
+            mask = (centers >= float(lo)) & (centers < float(hi))
+            if int(np.sum(mask)) == 0:
+                adjusted.append((float(lo), float(hi), float(th)))
+                continue
+            m_now = compute_local_escalation_metrics(y_cal[mask], y_score[mask], float(th))
+            ftr_now = float(m_now["false_trigger_rate_non_escalation"])
+            if ftr_now > float(cfg.local_track_false_escalation_threshold):
+                ftr_target = float(cfg.local_track_false_escalation_threshold)
+                candidate_th = np.quantile(y_score[mask][y_cal[mask] == 0], min(max(1.0 - ftr_target, 0.0), 1.0)) if np.any(y_cal[mask] == 0) else th
+                th = float(np.clip(max(float(th), float(candidate_th)), 0.05, 0.95))
+            adjusted.append((float(lo), float(hi), float(th)))
+        out["local_thresholds_by_band"] = adjusted
     return out
 
 
@@ -2101,6 +2126,7 @@ def run_hybrid_ml_controller(
     fallback = 0
     fallback_reason = "none"
     candidate_accept = 0
+    candidate_accept_source = "none"
     candidate_reject_reason = "not_evaluated_local_track"
     best_candidate_index = -1
     best_candidate_pre_refine_power = float(ref_p)
@@ -2196,15 +2222,35 @@ def run_hybrid_ml_controller(
         gate_mode = str(calib.get("candidate_gate_score_mode", "mean")).lower()
         gate_score = max_cand_score if gate_mode == "max" else mean_cand_score
         if gate_score < cand_gate_th:
+            pred["coarse_multipeak"] = int(coarse_multipeak)
+            override_runtime = runtime_candidate_acceptance_from_prediction(
+                oracle=oracle,
+                pred=pred,
+                coarse_best_v=coarse_best_v,
+                coarse_best_p=coarse_best_p,
+                ref_p=ref_p,
+                low_confidence=low_confidence,
+                cfg=cfg,
+            )
             fallback = 1
             fallback_reason = "candidate_confidence_below_threshold"
             candidate_reject_reason = "candidate_confidence_below_threshold"
             candidate_accept = 0
-            best_candidate_index = -1
-            best_candidate_pre_refine_power = float(ref_p)
-            best_candidate_post_refine_power = float(ref_p)
+            candidate_accept_source = "none"
+            best_candidate_index = int(override_runtime["best_candidate_index"])
+            best_candidate_pre_refine_power = float(override_runtime["best_candidate_pre_refine_power"])
+            best_candidate_post_refine_power = float(override_runtime["best_candidate_post_refine_power"])
+            # runtime-verified override: even if score-gated, accept if already verified near coarse best.
+            if float(best_candidate_post_refine_power) >= cfg.verify_ratio_threshold * max(coarse_best_p, 1e-9):
+                vbest = float(override_runtime["best_candidate_voltage"])
+                pbest = float(best_candidate_post_refine_power)
+                fallback = 0
+                fallback_reason = "runtime_verified_candidate_override"
+                candidate_reject_reason = "runtime_verified_candidate_override"
+                candidate_accept = 1
+                candidate_accept_source = "learned_candidate"
             # ===== MODIFIED SECTION (PATCH 2): top-2 zone bridge attempt before widened scan =====
-            if np.isfinite(zone_verified_best_v):
+            if fallback == 1 and np.isfinite(zone_verified_best_v):
                 zb_v, zb_p, _ = refine_local(oracle, float(zone_verified_best_v), cfg)
                 zone_verified_used_as_bridge_candidate = True
                 if float(zb_p) >= cfg.verify_ratio_threshold * max(coarse_best_p, 1e-9):
@@ -2212,6 +2258,8 @@ def run_hybrid_ml_controller(
                     fallback = 0
                     fallback_reason = "zone_bridge_candidate_verified"
                     candidate_reject_reason = "zone_bridge_candidate_verified"
+                    candidate_accept = 1
+                    candidate_accept_source = "zone_bridge"
                 else:
                     fallback_after_zone_bridge = True
         else:
@@ -2232,12 +2280,14 @@ def run_hybrid_ml_controller(
             vbest = float(cand_runtime["best_candidate_voltage"])
             pbest = float(best_candidate_post_refine_power)
             if candidate_accept == 0:
+                candidate_accept_source = "none"
                 candidate_reject_reason = str(cand_runtime["fallback_reason"])
                 fallback = 1
                 fallback_reason = f"candidate_reject:{candidate_reject_reason}"
                 if candidate_reject_reason == "sanity_worse_than_coarse":
                     sanity_trigger = 1
             else:
+                candidate_accept_source = "learned_candidate"
                 candidate_reject_reason = "accepted"
     else:
         mean_cand_score = float(np.mean(pred["candidate_scores"]))
@@ -2280,6 +2330,7 @@ def run_hybrid_ml_controller(
         "low_confidence": low_confidence,
         "sanity_trigger": sanity_trigger,
         "candidate_accept": int(candidate_accept),
+        "candidate_accept_source": str(candidate_accept_source),
         "candidate_reject_reason": candidate_reject_reason,
         "best_candidate_index": int(best_candidate_index),
         "best_candidate_pre_refine_power": float(best_candidate_pre_refine_power),
@@ -2296,7 +2347,7 @@ def run_hybrid_ml_controller(
         "mean_candidate_confidence_deprecated_alias": float(mean_cand_score),
         "candidate_confidence_min_deprecated_alias": float(min_cand_score),
         "candidate_confidence_max_deprecated_alias": float(max_cand_score),
-        "used_ml_candidates": int(enter_shade_mode and (fallback == 0)),
+        "used_ml_candidates": int(enter_shade_mode and (fallback == 0) and (candidate_accept_source in ("learned_candidate", "zone_bridge"))),
         "used_fallback_scan": int(fallback),
         "candidate_disagreement": float(pred.get("candidate_disagreement", 0.0)),
         "V_candidates_pred": list(pred.get("V_candidates", [])),
@@ -2429,7 +2480,12 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
     learned_mask = (df["candidate_fields_are_learned"] == 1) if "candidate_fields_are_learned" in df else pd.Series(False, index=df.index)
     learned_df = df[learned_mask].copy()
     cand_accept = float(learned_df["candidate_accept"].mean()) if ("candidate_accept" in learned_df and len(learned_df) > 0) else np.nan
+    accept_source = learned_df.get("candidate_accept_source", pd.Series(["none"] * len(learned_df), index=learned_df.index)) if len(learned_df) > 0 else pd.Series(dtype=object)
+    direct_accept_rate = float((accept_source == "learned_candidate").mean()) if len(learned_df) > 0 else np.nan
+    zone_bridge_accept_rate = float((accept_source == "zone_bridge").mean()) if len(learned_df) > 0 else np.nan
     mean_cand_score = float(learned_df["mean_candidate_score"].mean()) if ("mean_candidate_score" in learned_df and len(learned_df) > 0) else np.nan
+    zone_bridge_success_mask = (accept_source == "zone_bridge") if len(learned_df) > 0 else pd.Series(dtype=bool)
+    zone_bridge_attempt_mask = (learned_df.get("zone_verified_used_as_bridge_candidate", 0) == 1)
     return {
         "average_tracking_efficiency": float(df["efficiency"].mean()),
         "average_power_ratio": float(df["ratio"].mean()),
@@ -2449,6 +2505,8 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
         "used_ml_candidates_rate": float(learned_df["used_ml_candidates"].mean()) if ("used_ml_candidates" in learned_df and len(learned_df) > 0) else np.nan,
         "used_fallback_scan_rate": float(learned_df["used_fallback_scan"].mean()) if ("used_fallback_scan" in learned_df and len(learned_df) > 0) else np.nan,
         "learned_top_candidate_avoids_fallback_pct": float(100.0 * ((learned_df["candidate_accept"] == 1) & (learned_df["fallback"] == 0)).mean()) if ("candidate_accept" in learned_df and len(learned_df) > 0) else np.nan,
+        "direct_learned_candidate_accept_rate": direct_accept_rate,
+        "zone_bridge_accept_rate": zone_bridge_accept_rate,
         "candidate_set_contains_usable_near_gmpp_start_pct": float(100.0 * (learned_df["best_candidate_pre_refine_power"] >= 0.98 * learned_df["best_candidate_post_refine_power"]).mean()) if ("best_candidate_pre_refine_power" in learned_df and len(learned_df) > 0) else np.nan,
         "rescued_by_widened_scan_after_candidate_failure_pct": float(100.0 * ((learned_df["fallback"] == 1) & (learned_df["candidate_reject_reason"] != "not_evaluated_local_track")).mean()) if ("fallback" in learned_df and len(learned_df) > 0) else np.nan,
         "candidate_utility_scope": "rows_where_candidate_fields_are_learned==True",
@@ -2456,8 +2514,8 @@ def compute_controller_metrics(df: pd.DataFrame) -> Dict[str, float]:
         "candidate_utility_rows_total": int(len(df)),
         "top2_zone_evaluation_used_rate": float(df["top2_zone_evaluation_used"].mean()) if "top2_zone_evaluation_used" in df else np.nan,
         "confidence_triggered_fallback_rate": float(df["confidence_triggered_fallback"].mean()) if "confidence_triggered_fallback" in df else np.nan,
-        "top2_zone_bridge_success_rate": float(((df.get("zone_verified_used_as_bridge_candidate", 0) == 1) & (df.get("fallback_after_zone_bridge", 0) == 0)).mean()) if "zone_verified_used_as_bridge_candidate" in df else np.nan,
-        "top2_zone_reduced_fallback_rate": float((df.get("fallback_after_zone_bridge", pd.Series(np.zeros(len(df), dtype=int))).mean() if "fallback_after_zone_bridge" in df else 0.0)),
+        "top2_zone_bridge_success_rate": float((zone_bridge_success_mask.sum() / max(int(zone_bridge_attempt_mask.sum()), 1))) if len(learned_df) > 0 else np.nan,
+        "top2_zone_reduced_fallback_rate": float(zone_bridge_accept_rate) if len(learned_df) > 0 else np.nan,
         "top2_zone_reduced_voltage_error_rate": float(
             ((df.get("zone_verified_used_as_bridge_candidate", pd.Series(np.zeros(len(df), dtype=int))) == 1) & (df["v_diff_pct"] <= 5.0)).mean()
         ) if ("zone_verified_used_as_bridge_candidate" in df and "v_diff_pct" in df) else np.nan,
@@ -2910,9 +2968,12 @@ if len(micro_cal_ds["x"]):
         if (cfg.use_micro_ml_detector and micro_detector is not None) else float(np.clip(0.55 * row[4] + 0.30 * row[5] + 0.15 * row[6], 0.0, 1.0))
         for row in micro_cal_ds["x"]
     ], dtype=float)
-    local_runtime_detector_metrics = compute_local_escalation_metrics(
+    local_runtime_detector_metrics = compute_local_escalation_metrics_runtime_thresholds(
         micro_cal_ds["y"],
         local_runtime_scores,
+        np.asarray(micro_cal_ds["x"][:, 0], dtype=float),
+        local_escalation_cal,
+        cfg,
         float(local_escalation_cal.get("micro_escalation_threshold", local_escalation_cal.get("local_escalation_trigger_threshold", cfg.local_shade_trigger_threshold))),
     )
 else:
@@ -3105,6 +3166,49 @@ def evaluate_local_detector(rows: List[Dict], cfg: Config, threshold: float, mic
     return y_true, y_score, center_norm, metrics
 
 
+def _resolve_per_state_local_thresholds(center_norm: np.ndarray, calib: Dict[str, float], cfg: Config, default_threshold: float) -> np.ndarray:
+    mode = str(calib.get("local_threshold_mode", "global"))
+    if mode != "center_band":
+        return np.full((len(center_norm),), float(default_threshold), dtype=float)
+    thresholds = np.full((len(center_norm),), float(calib.get("micro_escalation_threshold", default_threshold)), dtype=float)
+    for lo, hi, th in calib.get("local_thresholds_by_band", []):
+        mask = (center_norm >= float(lo)) & (center_norm < float(hi))
+        thresholds[mask] = float(th)
+    return thresholds
+
+
+def compute_local_escalation_metrics_runtime_thresholds(y_true: np.ndarray, y_score: np.ndarray, center_norm: np.ndarray, calib: Dict[str, float], cfg: Config, default_threshold: float) -> Dict[str, float]:
+    y_t = np.asarray(y_true, dtype=int)
+    y_s = np.asarray(y_score, dtype=float)
+    ctr = np.asarray(center_norm, dtype=float)
+    th = _resolve_per_state_local_thresholds(ctr, calib, cfg, default_threshold)
+    y_h = (y_s >= th).astype(int)
+    tp = int(np.sum((y_h == 1) & (y_t == 1)))
+    fp = int(np.sum((y_h == 1) & (y_t == 0)))
+    fn = int(np.sum((y_h == 0) & (y_t == 1)))
+    tn = int(np.sum((y_h == 0) & (y_t == 0)))
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-9)
+    tnr = tn / max(tn + fp, 1)
+    bal_acc = 0.5 * (recall + tnr)
+    return {
+        "threshold_mode": str(calib.get("local_threshold_mode", "global")),
+        "threshold": float(np.mean(th)) if len(th) else float(default_threshold),
+        "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "balanced_accuracy": float(bal_acc),
+        "false_trigger_rate_non_escalation": float(fp / max(fp + tn, 1)),
+        "missed_escalation_rate": float(fn / max(fn + tp, 1)),
+        "escalation_precision": float(precision),
+        "escalation_recall": float(recall),
+        "escalation_f1": float(f1),
+        "escalation_balanced_accuracy": float(bal_acc),
+    }
+
+
 def summarize_score_distribution(y_true: np.ndarray, y_score: np.ndarray) -> Dict[str, Dict[str, float]]:
     def _stats(arr: np.ndarray) -> Dict[str, float]:
         if len(arr) == 0:
@@ -3120,7 +3224,7 @@ def summarize_score_distribution(y_true: np.ndarray, y_score: np.ndarray) -> Dic
     return {"positive_states": _stats(pos), "negative_states": _stats(neg)}
 
 
-def local_detector_metrics_by_center_band(y_true: np.ndarray, y_score: np.ndarray, center_norm: np.ndarray, threshold: float):
+def local_detector_metrics_by_center_band(y_true: np.ndarray, y_score: np.ndarray, center_norm: np.ndarray, threshold: float, calib: Optional[Dict[str, float]] = None, cfg: Config = cfg):
     # ===== MODIFIED SECTION (PATCH 5): local detector stability across required operating regions =====
     bands = [(0.35, 0.55), (0.55, 0.65), (0.65, 0.75), (0.75, 0.90)]
     out = {}
@@ -3130,7 +3234,10 @@ def local_detector_metrics_by_center_band(y_true: np.ndarray, y_score: np.ndarra
         if int(np.sum(mask)) == 0:
             out[key] = {"n": 0, "note": "no samples in band"}
             continue
-        m = compute_local_escalation_metrics(y_true[mask], y_score[mask], threshold)
+        if isinstance(calib, dict):
+            m = compute_local_escalation_metrics_runtime_thresholds(y_true[mask], y_score[mask], center_norm[mask], calib, cfg, threshold)
+        else:
+            m = compute_local_escalation_metrics(y_true[mask], y_score[mask], threshold)
         out[key] = {
             "n": int(np.sum(mask)),
             "escalation_precision": float(m["escalation_precision"]),
@@ -3160,12 +3267,16 @@ _y_true_local_cnn, _y_score_local_cnn, _center_norm_local_cnn, local_metrics_cnn
     local_eval_threshold_cnn,
     micro_detector=cnn_cal.get("micro_detector", None) if cfg.use_micro_ml_detector else None,
 )
-local_center_band_metrics_mlp = local_detector_metrics_by_center_band(y_true_local, y_score_local, center_norm_local, local_eval_threshold_mlp)
+local_metrics_mlp = compute_local_escalation_metrics_runtime_thresholds(y_true_local, y_score_local, center_norm_local, mlp_cal, cfg, local_eval_threshold_mlp)
+local_metrics_cnn = compute_local_escalation_metrics_runtime_thresholds(_y_true_local_cnn, _y_score_local_cnn, _center_norm_local_cnn, cnn_cal, cfg, local_eval_threshold_cnn)
+local_center_band_metrics_mlp = local_detector_metrics_by_center_band(y_true_local, y_score_local, center_norm_local, local_eval_threshold_mlp, calib=mlp_cal, cfg=cfg)
 local_center_band_metrics_cnn = local_detector_metrics_by_center_band(
     _y_true_local_cnn,
     _y_score_local_cnn,
     _center_norm_local_cnn,
     local_eval_threshold_cnn,
+    calib=cnn_cal,
+    cfg=cfg,
 )
 shade_detection_modes = {
     "coarse_scan_detector_mode": "ml_classifier",
@@ -3226,6 +3337,7 @@ candidate_gate_diag_table = pd.DataFrame([
         "gate_score_mode": mlp_cal.get("candidate_gate_score_mode", "mean"),
         "useful_accept_rate": mlp_cal.get("candidate_useful_accept_rate", np.nan),
         "bad_accept_rate": mlp_cal.get("candidate_bad_accept_rate", np.nan),
+        "fallback_reduction": mlp_cal.get("candidate_threshold_sweep_table", [{}])[0].get("fallback_reduction", np.nan) if isinstance(mlp_cal.get("candidate_threshold_sweep_table", None), list) and len(mlp_cal.get("candidate_threshold_sweep_table", [])) else np.nan,
         **(mlp_cal.get("candidate_score_percentiles", {})),
     },
     {
@@ -3234,6 +3346,7 @@ candidate_gate_diag_table = pd.DataFrame([
         "gate_score_mode": cnn_cal.get("candidate_gate_score_mode", "mean"),
         "useful_accept_rate": cnn_cal.get("candidate_useful_accept_rate", np.nan),
         "bad_accept_rate": cnn_cal.get("candidate_bad_accept_rate", np.nan),
+        "fallback_reduction": cnn_cal.get("candidate_threshold_sweep_table", [{}])[0].get("fallback_reduction", np.nan) if isinstance(cnn_cal.get("candidate_threshold_sweep_table", None), list) and len(cnn_cal.get("candidate_threshold_sweep_table", [])) else np.nan,
         **(cnn_cal.get("candidate_score_percentiles", {})),
     },
 ])
@@ -3245,9 +3358,19 @@ top2_integration_diag = pd.DataFrame([
 ])
 print("\n=== 9E) top-2 integration diagnostics ===")
 print(top2_integration_diag)
-local_band_diag_table = pd.DataFrame(
-    [{"band": k, "threshold_mode": mlp_cal.get("local_threshold_mode", "global"), "threshold": mlp_cal.get("micro_escalation_threshold", np.nan), **v} for k, v in local_center_band_metrics_mlp.items()]
-)
+band_threshold_lookup = {}
+if str(mlp_cal.get("local_threshold_mode", "global")) == "center_band":
+    for lo, hi, th in mlp_cal.get("local_thresholds_by_band", []):
+        band_threshold_lookup[f"{float(lo):.2f}-{float(hi):.2f}_voc"] = float(th)
+local_band_diag_table = pd.DataFrame([
+    {
+        "band": k,
+        "threshold_mode": mlp_cal.get("local_threshold_mode", "global"),
+        "threshold": band_threshold_lookup.get(k, mlp_cal.get("micro_escalation_threshold", np.nan)),
+        **v,
+    }
+    for k, v in local_center_band_metrics_mlp.items()
+])
 print("\n=== 9F) local detector band diagnostics ===")
 print(local_band_diag_table)
 true_multipeak_diag = pd.DataFrame([
@@ -3273,7 +3396,14 @@ local_scores_train = _score_micro_dataset(micro_train_ds, cfg, micro_detector=ml
 local_scores_cal = _score_micro_dataset(micro_cal_ds, cfg, micro_detector=mlp_cal.get("micro_detector", None))
 local_scores_test = _score_micro_dataset(micro_test_ds, cfg, micro_detector=mlp_cal.get("micro_detector", None))
 local_diag_threshold = float(local_eval_threshold_mlp)
-local_test_metrics_diag = compute_local_escalation_metrics(micro_test_ds["y"], local_scores_test, local_diag_threshold) if len(micro_test_ds["y"]) else {
+local_test_metrics_diag = compute_local_escalation_metrics_runtime_thresholds(
+    micro_test_ds["y"],
+    local_scores_test,
+    np.asarray(micro_test_ds["x"][:, 0], dtype=float) if len(micro_test_ds["x"]) else np.zeros((0,), dtype=float),
+    mlp_cal,
+    cfg,
+    local_diag_threshold,
+) if len(micro_test_ds["y"]) else {
     "confusion_matrix": {"tn": 0, "fp": 0, "fn": 0, "tp": 0}
 }
 local_escalation_debug_report = {
@@ -3604,6 +3734,18 @@ if len(df_pref) > 0:
 print("\n=== 12B) fallback breakdown report (preferred model) ===")
 print(fallback_breakdown_report)
 final_recommendation["fallback_breakdown_report"] = fallback_breakdown_report
+candidate_conf_below_count = int(fallback_reason_counts.get("candidate_confidence_below_threshold", 0)) if len(df_pref) > 0 else 0
+final_diag_table = pd.DataFrame([{
+    "direct_learned_candidate_accept_rate": float(pref_metrics.get("direct_learned_candidate_accept_rate", np.nan)),
+    "zone_bridge_accept_rate": float(pref_metrics.get("zone_bridge_accept_rate", np.nan)),
+    "candidate_confidence_below_threshold_count": int(candidate_conf_below_count),
+    "top2_zone_bridge_success_rate": float(pref_metrics.get("top2_zone_bridge_success_rate", np.nan)),
+    "local_track_false_trigger_rate_non_escalation": float(local_track_false_trigger_rate_non_escalation),
+    "local_track_escalation_recall": float(local_track_escalation_recall),
+    "local_track_detector_gate": bool(local_track_gate),
+}])
+print("\n=== 12C) final diagnostic summary table ===")
+print(final_diag_table.to_string(index=False))
 print("\n=== A) calibration diagnostics ===")
 print({
     "uncertainty_calibration": {"mlp": mlp_cal, "cnn": cnn_cal},
