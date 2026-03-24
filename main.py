@@ -920,6 +920,25 @@ def masked_softmax_rank_loss(cand_rank_logits: torch.Tensor, y_rank_target: torc
     return (per_row * row_has_valid).sum() / denom
 
 
+def masked_candidate_rank_probabilities(cand_rank_logits: np.ndarray, cand_valid_probs: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    """Convert candidate rank logits to probabilities using masked softmax with validity gating."""
+    rank_logits = np.asarray(cand_rank_logits, dtype=np.float64)
+    valid_probs = np.asarray(cand_valid_probs, dtype=np.float64)
+    if rank_logits.size == 0:
+        return np.asarray([], dtype=np.float64)
+    if np.any(valid_probs >= threshold):
+        masked_logits = rank_logits.copy()
+        masked_logits[valid_probs < threshold] -= 1e6
+    else:
+        masked_logits = rank_logits
+    masked_logits = masked_logits - np.max(masked_logits)
+    exp_logits = np.exp(masked_logits)
+    denom = np.sum(exp_logits)
+    if not np.isfinite(denom) or denom <= 0.0:
+        return np.full_like(exp_logits, 1.0 / len(exp_logits), dtype=np.float64)
+    return exp_logits / denom
+
+
 def train_multitask_model(model, train_arrays, val_arrays, cfg: Config, stage: str):
     x_flat_tr, x_scalar_tr, x_seq_tr, yv_tr, ys_tr, ycv_tr, ycvd_tr, ycr_tr, *_ = train_arrays
     x_flat_va, x_scalar_va, x_seq_va, yv_va, ys_va, ycv_va, ycvd_va, ycr_va, *_ = val_arrays
@@ -1071,8 +1090,10 @@ def augment_train_arrays(train_arrays, cfg: Config):
             xq[ii, :, drop_idx] *= np.float32(1.0 - np.random.uniform(0.02, 0.10))
 
         # rebuild flat tail from augmented sequence while keeping scalar prefix
-        xf[:, 3:3 + cfg.k_samples] = xq[:, 0, :]
-        xf[:, 3 + cfg.k_samples:3 + 2 * cfg.k_samples] = xq[:, 1, :]
+        scalar_dim = xs.shape[1]
+        assert xf.shape[1] == scalar_dim + 2 * cfg.k_samples
+        xf[:, scalar_dim:scalar_dim + cfg.k_samples] = xq[:, 0, :]
+        xf[:, scalar_dim + cfg.k_samples:scalar_dim + 2 * cfg.k_samples] = xq[:, 1, :]
 
     return (
         xf.astype(np.float32),
@@ -1106,8 +1127,11 @@ def model_predict_api(
         sigma = float(raw_sigma * calib["sigma_scale"])
         shade_prob = float(torch.sigmoid(slogit).cpu().numpy()[0])
         cand_v_np = np.clip(cand_v.cpu().numpy()[0], cfg.sample_fracs_min, cfg.sample_fracs_max)
-        cand_conf_np = torch.sigmoid(cand_rank_logits).cpu().numpy()[0]
+        cand_rank_logits_np = cand_rank_logits.cpu().numpy()[0]
         cand_valid_np = torch.sigmoid(cand_valid_logits).cpu().numpy()[0]
+        cand_conf_np = masked_candidate_rank_probabilities(cand_rank_logits_np, cand_valid_np, threshold=0.5)
+        assert np.all(np.isfinite(cand_conf_np))
+        assert abs(np.sum(cand_conf_np) - 1.0) < 1e-4 or len(cand_conf_np) == 0
 
     confidence = float(np.clip(1.0 - sigma / (calib["sigma_threshold"] + 1e-9), 0.0, 1.0))
     shade_threshold = float(calib.get("shade_threshold", cfg.shade_prob_threshold))
@@ -1670,8 +1694,12 @@ def candidate_head_diagnostics(model, arrays, cfg: Config) -> Dict[str, float]:
         xq = torch.tensor(x_seq, device=cfg.device)
         _mu, _logvar, _slogit, cand_v, cand_rank_logits, cand_valid_logits = model(xb, xs, xq)
     cand_v = cand_v.cpu().numpy()
-    rank_prob = torch.sigmoid(cand_rank_logits).cpu().numpy()
+    cand_rank_logits_np = cand_rank_logits.cpu().numpy()
     valid_prob = torch.sigmoid(cand_valid_logits).cpu().numpy()
+    rank_prob = np.vstack([
+        masked_candidate_rank_probabilities(cand_rank_logits_np[i], valid_prob[i], threshold=0.5)
+        for i in range(cand_rank_logits_np.shape[0])
+    ]) if cand_rank_logits_np.shape[0] else np.zeros_like(cand_rank_logits_np)
     slot0_err = np.abs(cand_v[:, 0] - ycv[:, 0])
     slot1_mask = ycvd[:, 1] > 0.5
     slot1_err = np.abs(cand_v[slot1_mask, 1] - ycv[slot1_mask, 1]) if np.any(slot1_mask) else np.array([])
