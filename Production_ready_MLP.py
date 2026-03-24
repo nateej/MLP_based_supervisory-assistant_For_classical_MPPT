@@ -180,6 +180,18 @@ def _normalize_dataset_keys(raw: Dict[str, Any]) -> Dict[str, Any]:
     Optional:
       dynamic_flags
     """
+    grouped_detection_keys = [
+        "full_curvesOk_simulated",
+        "full_curvesSh_simulated",
+        "full_curvesOk_experimental",
+        "full_curvesSh_experimental",
+        "sim_curves",
+        "exp_curves",
+        "test_curves",
+    ]
+    if any(k in raw for k in grouped_detection_keys):
+        return _convert_grouped_curve_dataset_to_canonical(raw)
+
     key_aliases = {
         "curves_v": ["curves_v", "V", "voltage", "v_curves"],
         "curves_i": ["curves_i", "I", "current", "i_curves"],
@@ -205,6 +217,120 @@ def _normalize_dataset_keys(raw: Dict[str, Any]) -> Dict[str, Any]:
         out["dynamic_flags"] = np.zeros(n, dtype=np.int32)
 
     return out
+
+
+def extract_vi(curve: Any) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if curve is None:
+        return None
+
+    def _pick(mapping: Any, *names: str) -> Any:
+        for name in names:
+            if isinstance(mapping, dict) and name in mapping:
+                return mapping[name]
+            if hasattr(mapping, name):
+                return getattr(mapping, name)
+        return None
+
+    v: Any = None
+    i: Any = None
+
+    if isinstance(curve, dict):
+        v = _pick(curve, "v", "V", "voltage", "x")
+        i = _pick(curve, "i", "I", "current", "y")
+    elif isinstance(curve, (tuple, list)) and len(curve) >= 2:
+        v, i = curve[0], curve[1]
+    else:
+        v = _pick(curve, "v", "V", "voltage", "x")
+        i = _pick(curve, "i", "I", "current", "y")
+
+    if v is None or i is None:
+        arr = np.asarray(curve, dtype=object)
+        if arr.ndim >= 1 and arr.size >= 2:
+            v, i = arr.reshape(-1)[:2]
+
+    if v is None or i is None:
+        return None
+
+    v_arr = np.asarray(v).reshape(-1)
+    i_arr = np.asarray(i).reshape(-1)
+    if v_arr.size == 0 or i_arr.size == 0:
+        return None
+    n = min(v_arr.size, i_arr.size)
+    return v_arr[:n], i_arr[:n]
+
+
+def _convert_grouped_curve_dataset_to_canonical(raw: Dict[str, Any]) -> Dict[str, Any]:
+    grouped_sources: List[Tuple[str, str, int]] = [
+        ("full_curvesOk_simulated", "simulation", 0),
+        ("full_curvesSh_simulated", "simulation", 1),
+        ("full_curvesOk_experimental", "experimental", 0),
+        ("full_curvesSh_experimental", "experimental", 1),
+    ]
+
+    if "full_curvesOk_simulated" not in raw and "sim_curves" in raw:
+        grouped_sources.append(("sim_curves", "simulation", 0))
+    if "full_curvesOk_experimental" not in raw and "exp_curves" in raw:
+        grouped_sources.append(("exp_curves", "experimental", 0))
+    if "full_curvesOk_experimental" not in raw and "test_curves" in raw:
+        grouped_sources.append(("test_curves", "experimental", 0))
+
+    curves_v: List[np.ndarray] = []
+    curves_i: List[np.ndarray] = []
+    vmpp_true: List[float] = []
+    labels_shaded: List[int] = []
+    source_domain: List[str] = []
+    dynamic_flags: List[int] = []
+    total_seen = 0
+    total_valid = 0
+    total_skipped = 0
+
+    for key, domain, shade_label in grouped_sources:
+        if key not in raw:
+            continue
+        arr = np.asarray(raw[key], dtype=object).reshape(-1)
+        for curve in arr:
+            total_seen += 1
+            if curve is None:
+                total_skipped += 1
+                continue
+            try:
+                vi = extract_vi(curve)
+            except Exception:
+                total_skipped += 1
+                continue
+            if vi is None:
+                total_skipped += 1
+                continue
+            v, i = vi
+            try:
+                mpp = compute_mpp_dense(v, i)
+                vmpp_val = mpp["vmpp"] if isinstance(mpp, dict) else mpp[0]
+            except Exception:
+                total_skipped += 1
+                continue
+            curves_v.append(v)
+            curves_i.append(i)
+            vmpp_true.append(float(vmpp_val))
+            labels_shaded.append(int(shade_label))
+            source_domain.append(domain)
+            dynamic_flags.append(0)
+            total_valid += 1
+
+    print(
+        "Converted grouped dataset -> canonical format: "
+        f"total_seen={total_seen}, total_valid={total_valid}, total_skipped={total_skipped}"
+    )
+    if total_valid == 0:
+        raise ValueError("Grouped dataset detected, but no valid curves could be extracted.")
+
+    return {
+        "curves_v": np.asarray(curves_v, dtype=object),
+        "curves_i": np.asarray(curves_i, dtype=object),
+        "vmpp_true": np.asarray(vmpp_true, dtype=np.float32),
+        "labels_shaded": np.asarray(labels_shaded, dtype=np.int32),
+        "source_domain": np.asarray(source_domain, dtype=object),
+        "dynamic_flags": np.asarray(dynamic_flags, dtype=np.int32),
+    }
 
 
 def load_dataset(cfg: Config) -> Dict[str, Any]:
