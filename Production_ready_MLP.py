@@ -1129,33 +1129,50 @@ def run_hybrid_controller(
 
     low_conf = confidence < cfg.confidence_threshold
 
-    fallback_reason = "none"
-    if low_conf:
-        candidate = oracle.coarse_scan(cfg.widened_scan_points)
-        mode = "shade_gmppt_low_conf_widened_scan"
-        used_fallback = True
-        fallback_reason = "low_confidence"
-    else:
-        v_seed = float(
-            np.clip(
-                pred["vhat_norm"] * oracle.voc,
-                cfg.sample_fracs_min * oracle.voc,
-                cfg.sample_fracs_max * oracle.voc,
-            )
-        )
-        assert np.isfinite(v_seed)
-        assert 0.0 <= v_seed <= oracle.voc + 1e-9
-        candidate = refine_local(oracle, v_seed, voc=max(v), window_ratio=cfg.local_refine_window, steps=cfg.local_refine_steps)
-        mode = "shade_gmppt_refine_single_prior"
-        used_fallback = False
-
-    # deterministic verification against coarse-best
     coarse_best = coarse
-    if candidate["p"] + cfg.verification_power_tolerance * max(coarse_best["p"], 1e-6) < coarse_best["p"]:
+    mlp_seed_v = float(
+        np.clip(
+            pred["vhat_norm"] * oracle.voc,
+            cfg.sample_fracs_min * oracle.voc,
+            cfg.sample_fracs_max * oracle.voc,
+        )
+    )
+    assert np.isfinite(mlp_seed_v)
+    assert 0.0 <= mlp_seed_v <= oracle.voc + 1e-9
+
+    if confidence >= 0.80:
+        mlp_window_ratio = max(cfg.local_refine_window * 0.75, 0.04)
+    elif confidence >= 0.60:
+        mlp_window_ratio = cfg.local_refine_window
+    else:
+        mlp_window_ratio = min(cfg.local_refine_window * 1.5, 0.30)
+
+    mlp_ref = refine_local(oracle, mlp_seed_v, voc=max(v), window_ratio=mlp_window_ratio, steps=cfg.local_refine_steps)
+    coarse_ref = refine_local(
+        oracle, coarse_best["v"], voc=max(v), window_ratio=cfg.local_refine_window, steps=cfg.local_refine_steps
+    )
+    if mlp_ref["p"] >= coarse_ref["p"]:
+        best_ref = mlp_ref
+        runtime_outcome = "mlp_refine_wins"
+    else:
+        best_ref = coarse_ref
+        runtime_outcome = "coarse_refine_wins"
+
+    candidate = best_ref
+    mode = f"shade_gmppt_dual_seed_{runtime_outcome}"
+    used_fallback = False
+    fallback_reason = "none"
+
+    materially_weak_vs_coarse = (
+        best_ref["p"] + cfg.verification_power_tolerance * max(coarse_best["p"], 1e-6) < coarse_best["p"]
+    )
+    widened_scan_required = bool(materially_weak_vs_coarse or low_conf)
+    if widened_scan_required:
         candidate = oracle.coarse_scan(cfg.widened_scan_points)
-        mode = "verification_failed_widened_scan"
+        mode = "widened_scan_required"
         used_fallback = True
-        fallback_reason = "sanity_worse_than_coarse"
+        fallback_reason = "widened_scan_required"
+        runtime_outcome = "widened_scan_required"
 
     # LOCAL_TRACK deterministic escalation (guarded)
     if escalate:
@@ -1166,16 +1183,6 @@ def run_hybrid_controller(
 
     # Final authority: deterministic fallback vs candidate
     final_pick = candidate if candidate["p"] >= baseline["p"] else baseline
-    if final_pick is baseline:
-        used_fallback = True
-        if fallback_reason == "none":
-            fallback_reason = "refine_not_better_than_coarse"
-
-    if not low_conf and confidence < (cfg.confidence_threshold + 0.05):
-        if used_fallback and fallback_reason == "none":
-            fallback_reason = "low_global_confidence"
-    if used_fallback and shade_flag and confidence < (cfg.confidence_threshold + 0.03):
-        fallback_reason = "multipeak_weak_confidence"
 
     return {
         "ok": True,
@@ -1201,6 +1208,8 @@ def run_hybrid_controller(
         "shade_flag": shade_flag,
         "center_band": str(center_band),
         "fallback_reason": str(fallback_reason),
+        "runtime_outcome": str(runtime_outcome),
+        "mlp_refine_window_ratio": float(mlp_window_ratio),
     }
 
 
@@ -1215,6 +1224,9 @@ def _summary_metrics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
             "p95_voltage_percent_difference": 0.0,
             "p99_voltage_percent_difference": 0.0,
             "fallback_rate": 0.0,
+            "widened_scan_fallback_rate": 0.0,
+            "mlp_refine_win_rate": 0.0,
+            "coarse_refine_win_rate": 0.0,
             "shade_gmppt_mode_rate": 0.0,
             "count": 0,
         }
@@ -1222,6 +1234,9 @@ def _summary_metrics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     pr_det = np.array([r.get("deterministic_power_ratio", 0.0) for r in rows])
     vd = np.array([r["voltage_percent_diff"] for r in rows])
     fb = np.array([1.0 if r["fallback_used"] else 0.0 for r in rows])
+    widened_fb = np.array([1.0 if r.get("runtime_outcome", "none") == "widened_scan_required" else 0.0 for r in rows])
+    mlp_wins = np.array([1.0 if r.get("runtime_outcome", "none") == "mlp_refine_wins" else 0.0 for r in rows])
+    coarse_wins = np.array([1.0 if r.get("runtime_outcome", "none") == "coarse_refine_wins" else 0.0 for r in rows])
     sg = np.array([1.0 if r["shade_gmppt_mode_used"] else 0.0 for r in rows])
     return {
         "average_power_ratio": float(np.mean(pr)),
@@ -1229,6 +1244,9 @@ def _summary_metrics(rows: List[Dict[str, Any]]) -> Dict[str, float]:
         "p95_voltage_percent_difference": float(np.percentile(vd, 95)),
         "p99_voltage_percent_difference": float(np.percentile(vd, 99)),
         "fallback_rate": float(np.mean(fb)),
+        "widened_scan_fallback_rate": float(np.mean(widened_fb)),
+        "mlp_refine_win_rate": float(np.mean(mlp_wins)),
+        "coarse_refine_win_rate": float(np.mean(coarse_wins)),
         "shade_gmppt_mode_rate": float(np.mean(sg)),
         "count": int(len(rows)),
     }
@@ -1249,12 +1267,13 @@ def evaluate_controller(
     rows: List[Dict[str, Any]] = []
     previous_pmpp = None
     fallback_reason_counts: Dict[str, int] = {
-        "low_confidence": 0,
-        "sanity_worse_than_coarse": 0,
-        "refine_not_better_than_coarse": 0,
-        "multipeak_weak_confidence": 0,
-        "low_global_confidence": 0,
+        "widened_scan_required": 0,
         "none": 0,
+    }
+    runtime_outcome_counts: Dict[str, int] = {
+        "mlp_refine_wins": 0,
+        "coarse_refine_wins": 0,
+        "widened_scan_required": 0,
     }
 
     for k, i_idx in enumerate(idxs.tolist()):
@@ -1277,12 +1296,19 @@ def evaluate_controller(
         if reason not in fallback_reason_counts:
             reason = "none"
         fallback_reason_counts[reason] += 1
+        outcome = str(res.get("runtime_outcome", "mlp_refine_wins"))
+        if outcome not in runtime_outcome_counts:
+            outcome = "mlp_refine_wins"
+        runtime_outcome_counts[outcome] += 1
         previous_pmpp = res["pmpp_true"]
 
     denom = max(len(rows), 1)
     fallback_reason_fractions = {k: float(v / denom) for k, v in fallback_reason_counts.items()}
+    runtime_outcome_fractions = {k: float(v / denom) for k, v in runtime_outcome_counts.items()}
     print(f"[{subset_name}] fallback_reason_counts: {fallback_reason_counts}")
     print(f"[{subset_name}] fallback_reason_fractions: {fallback_reason_fractions}")
+    print(f"[{subset_name}] runtime_outcome_counts: {runtime_outcome_counts}")
+    print(f"[{subset_name}] runtime_outcome_fractions: {runtime_outcome_fractions}")
 
     return {
         "subset": subset_name,
@@ -1290,6 +1316,8 @@ def evaluate_controller(
         "rows": rows,
         "fallback_reason_counts": fallback_reason_counts,
         "fallback_reason_fractions": fallback_reason_fractions,
+        "runtime_outcome_counts": runtime_outcome_counts,
+        "runtime_outcome_fractions": runtime_outcome_fractions,
     }
 
 
@@ -1504,6 +1532,7 @@ def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
     source = prep["source_domain"]
     peaks = prep["dense_peak_count"]
     dyn = prep["dynamic_flags"]
+    y_vmpp_norm = prep["y_vmpp_norm"]
 
     nonshaded_test = test[y_shade[test] < 0.5]
     folder_labeled_shaded_test = test[(source[test] == "experimental") & (y_shade[test] >= 0.5)]
@@ -1513,21 +1542,77 @@ def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
 
     test_uniform = test[y_shade[test] < 0.5]
     test_shaded = test[y_shade[test] >= 0.5]
-    test_multipeak = test[peaks[test] >= 2]
-    test_singlepeak = test[peaks[test] < 2]
-    test_ambiguous = test[(y_shade[test] >= 0.35) & (y_shade[test] <= 0.65)]
-
     n_pair = int(min(len(test_uniform), len(test_shaded)))
     uniform_to_shaded_transition = np.concatenate([test_uniform[:n_pair], test_shaded[:n_pair]]) if n_pair > 0 else np.array([], dtype=int)
     shaded_to_uniform_transition = np.concatenate([test_shaded[:n_pair], test_uniform[:n_pair]]) if n_pair > 0 else np.array([], dtype=int)
 
-    n_peak_jump = int(min(len(test_singlepeak), len(test_multipeak)))
-    peak_jump_transition = np.concatenate([test_singlepeak[:n_peak_jump], test_multipeak[:n_peak_jump]]) if n_peak_jump > 0 else np.array([], dtype=int)
-
-    if len(test_ambiguous) == 0:
-        ambiguous_scan_transition = dynamic_transition_test
+    test_exp_sorted = test[np.argsort(y_vmpp_norm[test])]
+    if len(test_exp_sorted) >= 2:
+        half = len(test_exp_sorted) // 2
+        low_group = test_exp_sorted[:half]
+        high_group = test_exp_sorted[-half:]
+        n_peak_jump = int(min(len(low_group), len(high_group)))
+        pair_seq: List[int] = []
+        for j in range(n_peak_jump):
+            pair_seq.extend([int(low_group[j]), int(high_group[-(j + 1)])])
+        peak_jump_transition = np.asarray(pair_seq, dtype=int) if pair_seq else np.array([], dtype=int)
     else:
-        ambiguous_scan_transition = test_ambiguous
+        peak_jump_transition = np.array([], dtype=int)
+    peak_jump_transition_source = "experimental_test"
+    if len(peak_jump_transition) == 0:
+        sim_sorted = sim_pool[np.argsort(y_vmpp_norm[sim_pool])]
+        if len(sim_sorted) >= 2:
+            half = len(sim_sorted) // 2
+            low_group = sim_sorted[:half]
+            high_group = sim_sorted[-half:]
+            n_peak_jump = int(min(len(low_group), len(high_group)))
+            pair_seq = []
+            for j in range(n_peak_jump):
+                pair_seq.extend([int(low_group[j]), int(high_group[-(j + 1)])])
+            peak_jump_transition = np.asarray(pair_seq, dtype=int) if pair_seq else np.array([], dtype=int)
+            peak_jump_transition_source = "simulated_benchmark"
+        else:
+            peak_jump_transition_source = "unavailable"
+
+    ambiguous_by_peaks = test[peaks[test] >= 2]
+    ambiguous_by_shade_band = test[(y_shade[test] >= 0.35) & (y_shade[test] <= 0.65)]
+    ambiguous_scan_transition = np.unique(np.concatenate([ambiguous_by_peaks, ambiguous_by_shade_band])).astype(int)
+    ambiguous_scan_transition_source = "experimental_test"
+    if len(ambiguous_scan_transition) == 0:
+        sim_ambiguous_by_peaks = sim_pool[peaks[sim_pool] >= 2]
+        sim_ambiguous_by_shade_band = sim_pool[(y_shade[sim_pool] >= 0.35) & (y_shade[sim_pool] <= 0.65)]
+        ambiguous_scan_transition = np.unique(
+            np.concatenate([sim_ambiguous_by_peaks, sim_ambiguous_by_shade_band])
+        ).astype(int)
+        if len(ambiguous_scan_transition) > 0:
+            ambiguous_scan_transition_source = "simulated_benchmark"
+        else:
+            ambiguous_scan_transition_source = "unavailable"
+    if len(ambiguous_scan_transition) == 0:
+        ambiguous_scan_transition = dynamic_transition_test
+        if len(dynamic_transition_test) > 0:
+            ambiguous_scan_transition_source = "experimental_dynamic_flags"
+        else:
+            ambiguous_scan_transition_source = "unavailable"
+
+    if len(peak_jump_transition) == 0:
+        peak_jump_transition = dynamic_transition_test
+        if len(dynamic_transition_test) > 0:
+            peak_jump_transition_source = "experimental_dynamic_flags"
+        else:
+            peak_jump_transition_source = "unavailable"
+
+    if len(ambiguous_scan_transition) == 0:
+        ambiguous_scan_transition = dynamic_transition_test
+        if len(dynamic_transition_test) > 0:
+            ambiguous_scan_transition_source = "experimental_dynamic_flags"
+        else:
+            ambiguous_scan_transition_source = "unavailable"
+
+    if len(ambiguous_scan_transition) == 0:
+        ambiguous_scan_transition_source = "unavailable"
+    else:
+        ambiguous_scan_transition = ambiguous_scan_transition.astype(int)
 
     simulated_multipeak_used = False
     true_multipeak_test = true_multipeak_exp_test
@@ -1546,6 +1631,8 @@ def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
         "shaded_to_uniform_transition": shaded_to_uniform_transition,
         "peak_jump_transition": peak_jump_transition,
         "ambiguous_scan_transition": ambiguous_scan_transition,
+        "peak_jump_transition_source": np.array([peak_jump_transition_source], dtype=object),
+        "ambiguous_scan_transition_source": np.array([ambiguous_scan_transition_source], dtype=object),
         "simulated_multipeak_used": np.array([simulated_multipeak_used]),
     }
 
@@ -1555,9 +1642,13 @@ def _print_block(title: str, metrics: Dict[str, Any]) -> None:
     for k in [
         "count",
         "average_power_ratio",
+        "average_power_ratio_deterministic",
         "p95_voltage_percent_difference",
         "p99_voltage_percent_difference",
         "fallback_rate",
+        "widened_scan_fallback_rate",
+        "mlp_refine_win_rate",
+        "coarse_refine_win_rate",
         "shade_gmppt_mode_rate",
     ]:
         if k in metrics:
@@ -1818,6 +1909,8 @@ def main() -> None:
     print("\n--- dynamic transition metrics ---")
     for scenario_name, scenario_metrics in dyn_metrics.items():
         _print_block(f"dynamic::{scenario_name}", scenario_metrics)
+    print(f"peak_jump_transition_source: {str(subsets['peak_jump_transition_source'][0])}")
+    print(f"ambiguous_scan_transition_source: {str(subsets['ambiguous_scan_transition_source'][0])}")
 
     print("\n[True multi-peak subset availability]")
     print(f"true_multipeak_exp_test_available: {true_multipeak_exp_test_available}")
@@ -1855,6 +1948,9 @@ def main() -> None:
     print(f"fallback_reason_counts_nonshaded: {reports['nonshaded_test']['fallback_reason_counts']}")
     print(f"fallback_reason_counts_shaded: {reports['folder_labeled_shaded_test']['fallback_reason_counts']}")
     print(f"fallback_reason_counts_true_multipeak: {reports['true_multipeak_test']['fallback_reason_counts']}")
+    print(f"runtime_outcome_counts_nonshaded: {reports['nonshaded_test']['runtime_outcome_counts']}")
+    print(f"runtime_outcome_counts_shaded: {reports['folder_labeled_shaded_test']['runtime_outcome_counts']}")
+    print(f"runtime_outcome_counts_true_multipeak: {reports['true_multipeak_test']['runtime_outcome_counts']}")
 
     print("\n[Coarse shade head]")
     print(f"shade_threshold: {shade_thr}")
