@@ -120,7 +120,7 @@ class Config:
     local_track_false_trigger_rate_max: float = 0.10
     local_track_escalation_recall_min: float = 0.75
     nonshaded_no_harm_tolerance: float = 0.002
-    micro_escalate_ratio_threshold: float = 1.02
+    micro_escalate_ratio_threshold: float = 1.0005
 
     # validation flags (must all be true to claim industry-ready)
     has_true_standard_static: bool = False
@@ -837,42 +837,64 @@ def build_micro_scan_features(v_hist: Sequence[float], p_hist: Sequence[float], 
 def collect_local_track_runtime_states(curves_v: np.ndarray, curves_i: np.ndarray, cfg: Config) -> List[Dict[str, Any]]:
     states: List[Dict[str, Any]] = []
     escalation_gain_ratio_list: List[float] = []
+    fixed_centers_norm = [0.35, 0.45, 0.55, 0.65, 0.75, 0.85]
     for v, i in zip(curves_v, curves_i):
         v, i = clean_iv_curve(v, i)
         if not validate_cleaned_curve(v, i):
             continue
         p = v * i
         oracle = CurveOracle(v, i)
-        center = int(len(v) // 2)
-        center_v = float(v[center])
-        center_norm = float(center_v / max(oracle.voc, 1e-6))
-        band = physical_center_band_label(center_norm)
-        feat = build_micro_scan_features(v[max(0, center - 3): center + 4], p[max(0, center - 3): center + 4], center_norm)
-        local_ref = refine_local(
-            oracle,
-            center_v,
-            voc=oracle.voc,
-            window_ratio=cfg.local_refine_window,
-            steps=cfg.local_refine_steps,
-        )
-        local_p_best = float(local_ref["p"])
+        coarse_best = oracle.coarse_scan(cfg.coarse_scan_points)
+        rollout_center_norm = float(v[int(len(v) // 2)] / max(oracle.voc, 1e-6))
+
+        candidate_centers_norm = fixed_centers_norm + [
+            0.25,  # low-voltage shaded probe
+            0.90,  # high-voltage probe
+            float(np.clip((coarse_best["v"] / max(oracle.voc, 1e-6)) * 0.90, 0.0, 1.0)),  # coarse-best-offset probe
+            rollout_center_norm,  # keep rollout-like center
+        ]
+
+        # de-duplicate while preserving order
+        seen = set()
+        unique_centers_norm: List[float] = []
+        for c in candidate_centers_norm:
+            ck = round(float(c), 6)
+            if ck in seen:
+                continue
+            seen.add(ck)
+            unique_centers_norm.append(float(c))
+
         global_v_true = float(oracle.vmpp_true)
         global_p_true = float(oracle.pmpp_true)
-        escalation_gain_ratio = float(global_p_true / max(local_p_best, 1e-9))
-        target = int(global_p_true >= cfg.micro_escalate_ratio_threshold * max(local_p_best, 1e-9))
-        escalation_gain_ratio_list.append(escalation_gain_ratio)
-        states.append(
-            {
-                "x": feat,
-                "y": target,
-                "band": band,
-                "center_norm": center_norm,
-                "local_p_best": local_p_best,
-                "global_p_true": global_p_true,
-                "global_v_true": global_v_true,
-                "escalation_gain_ratio": escalation_gain_ratio,
-            }
-        )
+        for center_norm_in in unique_centers_norm:
+            center_v = float(np.clip(center_norm_in * oracle.voc, float(v[0]), float(v[-1])))
+            center_norm = float(center_v / max(oracle.voc, 1e-6))
+            band = physical_center_band_label(center_norm)
+            center_idx = int(np.argmin(np.abs(v - center_v)))
+            feat = build_micro_scan_features(v[max(0, center_idx - 3): center_idx + 4], p[max(0, center_idx - 3): center_idx + 4], center_norm)
+            local_ref = refine_local(
+                oracle,
+                center_v,
+                voc=oracle.voc,
+                window_ratio=cfg.local_refine_window,
+                steps=cfg.local_refine_steps,
+            )
+            local_p_best = float(local_ref["p"])
+            escalation_gain_ratio = float(global_p_true / max(local_p_best, 1e-9))
+            target = int(global_p_true >= cfg.micro_escalate_ratio_threshold * max(local_p_best, 1e-9))
+            escalation_gain_ratio_list.append(escalation_gain_ratio)
+            states.append(
+                {
+                    "x": feat,
+                    "y": target,
+                    "band": band,
+                    "center_norm": center_norm,
+                    "local_p_best": local_p_best,
+                    "global_p_true": global_p_true,
+                    "global_v_true": global_v_true,
+                    "escalation_gain_ratio": escalation_gain_ratio,
+                }
+            )
     assert np.all(np.isfinite(np.asarray(escalation_gain_ratio_list, dtype=float)))
     return states
 
@@ -886,40 +908,84 @@ def build_micro_dataset(states: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.nd
     return x, y, b
 
 
-def train_micro_detector(x: np.ndarray, y: np.ndarray, device: str = "cpu") -> MicroLocalMLP:
+def train_micro_detector(x: np.ndarray, y: np.ndarray, device: str = "cpu") -> Tuple[MicroLocalMLP, float]:
     model = MicroLocalMLP(input_dim=x.shape[1]).to(device)
     if len(x) == 0:
-        return model
+        return model, 1.0
+
+    y_int = y.astype(np.int32)
+    n_pos = int(np.sum(y_int == 1))
+    n_neg = int(np.sum(y_int == 0))
+    pos_weight_value = float(n_neg / max(n_pos, 1))
+    positive_rate = float(n_pos / max(len(y_int), 1))
+    pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     ds = TensorDataset(torch.from_numpy(x).float(), torch.from_numpy(y).float())
     loader = DataLoader(ds, batch_size=128, shuffle=True)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     for _ in range(25):
+        epoch_loader = loader
+        if positive_rate < 0.10 and n_pos > 0:
+            pos_idx = np.where(y_int == 1)[0]
+            neg_idx = np.where(y_int == 0)[0]
+            target_pos = min(len(neg_idx), max(len(pos_idx), int(0.30 * len(neg_idx))))
+            sampled_pos = np.random.choice(pos_idx, size=target_pos, replace=True)
+            train_idx = np.concatenate([neg_idx, sampled_pos]).astype(np.int64)
+            np.random.shuffle(train_idx)
+            ds_epoch = TensorDataset(
+                torch.from_numpy(x[train_idx]).float(),
+                torch.from_numpy(y[train_idx]).float(),
+            )
+            epoch_loader = DataLoader(ds_epoch, batch_size=128, shuffle=True)
         model.train()
-        for xb, yb in loader:
+        for xb, yb in epoch_loader:
             xb, yb = xb.to(device), yb.to(device)
             logits = model(xb)
-            loss = F.binary_cross_entropy_with_logits(logits, yb)
+            loss = loss_fn(logits, yb)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-    return model
+    return model, pos_weight_value
 
 
-def calibrate_local_thresholds(model: MicroLocalMLP, x: np.ndarray, y: np.ndarray, bands: np.ndarray, device: str = "cpu") -> Dict[str, float]:
+def calibrate_local_thresholds(
+    model: MicroLocalMLP,
+    x: np.ndarray,
+    y: np.ndarray,
+    bands: np.ndarray,
+    device: str = "cpu",
+    min_band_samples: int = 25,
+) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, str]]:
     thresholds = {label: 0.5 for _, _, label in PHYSICAL_CENTER_BANDS}
+    band_counts = {label: 0 for _, _, label in PHYSICAL_CENTER_BANDS}
+    threshold_source = {label: "global_fallback" for _, _, label in PHYSICAL_CENTER_BANDS}
     if len(x) == 0:
-        return thresholds
+        return thresholds, band_counts, threshold_source
 
     model.eval()
     with torch.no_grad():
         probs = torch.sigmoid(model(torch.from_numpy(x).float().to(device))).cpu().numpy()
 
+    best_global_t = 0.5
+    best_global_cost = 1e9
+    for t in np.linspace(0.3, 0.9, 61):
+        pred = (probs >= t).astype(int)
+        fp = np.mean((pred == 1) & (y == 0))
+        fn = np.mean((pred == 0) & (y == 1))
+        cost = 2.0 * fp + fn
+        if cost < best_global_cost:
+            best_global_cost = cost
+            best_global_t = float(t)
+    for b in thresholds:
+        thresholds[b] = best_global_t
+
     for b in thresholds:
         idx = np.where(bands == b)[0]
-        if len(idx) < 8:
+        band_counts[b] = int(len(idx))
+        if len(idx) < min_band_samples:
             continue
         pb = probs[idx]
         yb = y[idx]
@@ -934,7 +1000,8 @@ def calibrate_local_thresholds(model: MicroLocalMLP, x: np.ndarray, y: np.ndarra
                 best_cost = cost
                 best_t = float(t)
         thresholds[b] = float(best_t)
-    return thresholds
+        threshold_source[b] = "band_specific"
+    return thresholds, band_counts, threshold_source
 
 
 def compute_local_escalation_metrics_runtime_thresholds(probs: np.ndarray, y: np.ndarray, bands: np.ndarray, thresholds: Dict[str, float]) -> Dict[str, float]:
@@ -951,19 +1018,28 @@ def compute_local_escalation_metrics_runtime_thresholds(probs: np.ndarray, y: np
     }
 
 
-def local_detector_metrics_by_center_band_runtime_thresholds(probs: np.ndarray, y: np.ndarray, bands: np.ndarray, thresholds: Dict[str, float]) -> Dict[str, Any]:
+def local_detector_metrics_by_center_band_runtime_thresholds(
+    probs: np.ndarray,
+    y: np.ndarray,
+    bands: np.ndarray,
+    thresholds: Dict[str, float],
+    min_band_samples: int = 25,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for b in [label for _, _, label in PHYSICAL_CENTER_BANDS]:
         idx = np.where(bands == b)[0]
         if len(idx) == 0:
-            out[b] = {"ftr": None, "recall": None}
+            out[b] = {"ftr": None, "recall": None, "insufficient_samples": True, "sample_count": 0}
+            continue
+        if len(idx) < min_band_samples:
+            out[b] = {"ftr": None, "recall": None, "insufficient_samples": True, "sample_count": int(len(idx))}
             continue
         pb = probs[idx]
         yb = y[idx].astype(int)
         pred = (pb >= thresholds.get(b, 0.5)).astype(int)
         ftr = float(np.mean((pred == 1) & (yb == 0)))
         rec = float(np.sum((pred == 1) & (yb == 1)) / max(np.sum(yb == 1), 1))
-        out[b] = {"ftr": ftr, "recall": rec}
+        out[b] = {"ftr": ftr, "recall": rec, "insufficient_samples": False, "sample_count": int(len(idx))}
     return out
 
 
@@ -1053,10 +1129,12 @@ def run_hybrid_controller(
 
     low_conf = confidence < cfg.confidence_threshold
 
+    fallback_reason = "none"
     if low_conf:
         candidate = oracle.coarse_scan(cfg.widened_scan_points)
         mode = "shade_gmppt_low_conf_widened_scan"
         used_fallback = True
+        fallback_reason = "low_confidence"
     else:
         v_seed = float(
             np.clip(
@@ -1077,6 +1155,7 @@ def run_hybrid_controller(
         candidate = oracle.coarse_scan(cfg.widened_scan_points)
         mode = "verification_failed_widened_scan"
         used_fallback = True
+        fallback_reason = "sanity_worse_than_coarse"
 
     # LOCAL_TRACK deterministic escalation (guarded)
     if escalate:
@@ -1087,7 +1166,16 @@ def run_hybrid_controller(
 
     # Final authority: deterministic fallback vs candidate
     final_pick = candidate if candidate["p"] >= baseline["p"] else baseline
-    used_fallback = used_fallback or (final_pick is baseline)
+    if final_pick is baseline:
+        used_fallback = True
+        if fallback_reason == "none":
+            fallback_reason = "refine_not_better_than_coarse"
+
+    if not low_conf and confidence < (cfg.confidence_threshold + 0.05):
+        if used_fallback and fallback_reason == "none":
+            fallback_reason = "low_global_confidence"
+    if used_fallback and shade_flag and confidence < (cfg.confidence_threshold + 0.03):
+        fallback_reason = "multipeak_weak_confidence"
 
     return {
         "ok": True,
@@ -1112,6 +1200,7 @@ def run_hybrid_controller(
         "shade_prob": shade_prob,
         "shade_flag": shade_flag,
         "center_band": str(center_band),
+        "fallback_reason": str(fallback_reason),
     }
 
 
@@ -1159,6 +1248,14 @@ def evaluate_controller(
 ) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
     previous_pmpp = None
+    fallback_reason_counts: Dict[str, int] = {
+        "low_confidence": 0,
+        "sanity_worse_than_coarse": 0,
+        "refine_not_better_than_coarse": 0,
+        "multipeak_weak_confidence": 0,
+        "low_global_confidence": 0,
+        "none": 0,
+    }
 
     for k, i_idx in enumerate(idxs.tolist()):
         res = run_hybrid_controller(
@@ -1176,12 +1273,23 @@ def evaluate_controller(
         if not res["ok"]:
             continue
         rows.append(res)
+        reason = str(res.get("fallback_reason", "none"))
+        if reason not in fallback_reason_counts:
+            reason = "none"
+        fallback_reason_counts[reason] += 1
         previous_pmpp = res["pmpp_true"]
+
+    denom = max(len(rows), 1)
+    fallback_reason_fractions = {k: float(v / denom) for k, v in fallback_reason_counts.items()}
+    print(f"[{subset_name}] fallback_reason_counts: {fallback_reason_counts}")
+    print(f"[{subset_name}] fallback_reason_fractions: {fallback_reason_fractions}")
 
     return {
         "subset": subset_name,
         "metrics": _summary_metrics(rows),
         "rows": rows,
+        "fallback_reason_counts": fallback_reason_counts,
+        "fallback_reason_fractions": fallback_reason_fractions,
     }
 
 
@@ -1204,6 +1312,7 @@ def evaluate_local_detector(
     bands: np.ndarray,
     thresholds: Dict[str, float],
     cfg: Config,
+    min_band_samples: int = 25,
 ) -> Dict[str, Any]:
     if len(x) == 0:
         return {
@@ -1221,7 +1330,7 @@ def evaluate_local_detector(
         probs = torch.sigmoid(detector(torch.from_numpy(x).float().to(cfg.device))).cpu().numpy()
 
     global_metrics = compute_local_escalation_metrics_runtime_thresholds(probs, y, bands, thresholds)
-    by_band = local_detector_metrics_by_center_band_runtime_thresholds(probs, y, bands, thresholds)
+    by_band = local_detector_metrics_by_center_band_runtime_thresholds(probs, y, bands, thresholds, min_band_samples=min_band_samples)
 
     gate_pass = (
         global_metrics["false_trigger_rate_non_escalation"] <= cfg.local_track_false_trigger_rate_max
@@ -1249,8 +1358,11 @@ def evaluate_local_detector(
     }
 
 
-def evaluate_dynamic_scenarios(rows: List[Dict[str, Any]]) -> Dict[str, float]:
-    return _summary_metrics(rows)
+def evaluate_dynamic_scenarios(scenario_rows: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for scenario, rows in scenario_rows.items():
+        out[scenario] = _summary_metrics(rows)
+    return out
 
 
 def profile_model_compute(model: ProductionMLP, input_dim: int, device: str) -> Dict[str, float]:
@@ -1399,6 +1511,24 @@ def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
     true_multipeak_sim_benchmark = sim_pool[peaks[sim_pool] >= 2]
     dynamic_transition_test = test[dyn[test] > 0]
 
+    test_uniform = test[y_shade[test] < 0.5]
+    test_shaded = test[y_shade[test] >= 0.5]
+    test_multipeak = test[peaks[test] >= 2]
+    test_singlepeak = test[peaks[test] < 2]
+    test_ambiguous = test[(y_shade[test] >= 0.35) & (y_shade[test] <= 0.65)]
+
+    n_pair = int(min(len(test_uniform), len(test_shaded)))
+    uniform_to_shaded_transition = np.concatenate([test_uniform[:n_pair], test_shaded[:n_pair]]) if n_pair > 0 else np.array([], dtype=int)
+    shaded_to_uniform_transition = np.concatenate([test_shaded[:n_pair], test_uniform[:n_pair]]) if n_pair > 0 else np.array([], dtype=int)
+
+    n_peak_jump = int(min(len(test_singlepeak), len(test_multipeak)))
+    peak_jump_transition = np.concatenate([test_singlepeak[:n_peak_jump], test_multipeak[:n_peak_jump]]) if n_peak_jump > 0 else np.array([], dtype=int)
+
+    if len(test_ambiguous) == 0:
+        ambiguous_scan_transition = dynamic_transition_test
+    else:
+        ambiguous_scan_transition = test_ambiguous
+
     simulated_multipeak_used = False
     true_multipeak_test = true_multipeak_exp_test
     if len(true_multipeak_test) == 0:
@@ -1412,6 +1542,10 @@ def _subset_indices(prep: Dict[str, Any]) -> Dict[str, np.ndarray]:
         "true_multipeak_sim_benchmark": true_multipeak_sim_benchmark,
         "true_multipeak_test": true_multipeak_test,
         "dynamic_transition_test": dynamic_transition_test,
+        "uniform_to_shaded_transition": uniform_to_shaded_transition,
+        "shaded_to_uniform_transition": shaded_to_uniform_transition,
+        "peak_jump_transition": peak_jump_transition,
+        "ambiguous_scan_transition": ambiguous_scan_transition,
         "simulated_multipeak_used": np.array([simulated_multipeak_used]),
     }
 
@@ -1503,7 +1637,7 @@ def main() -> None:
     mx, my, mb = build_micro_dataset(local_states_train)
     if np.sum(my >= 0.5) <= 0:
         raise RuntimeError("local escalation labels collapsed to zero positives; inspect sampling policy or threshold")
-    micro = train_micro_detector(mx, my, device=cfg.device)
+    micro, pos_weight_used = train_micro_detector(mx, my, device=cfg.device)
 
     if len(mx) > 0:
         with torch.no_grad():
@@ -1511,8 +1645,10 @@ def main() -> None:
     else:
         mprobs = np.zeros((0,), dtype=np.float32)
 
-    local_thresholds = calibrate_local_thresholds(micro, mx, my, mb, device=cfg.device)
-    local_eval = evaluate_local_detector(micro, mx, my, mb, local_thresholds, cfg)
+    local_thresholds, local_band_sample_counts, local_band_threshold_source = calibrate_local_thresholds(
+        micro, mx, my, mb, device=cfg.device, min_band_samples=25
+    )
+    local_eval = evaluate_local_detector(micro, mx, my, mb, local_thresholds, cfg, min_band_samples=25)
     local_eval["micro_target_definition"] = "global_vs_local_power_ratio"
     escalation_gain_ratio_all = np.asarray([s["escalation_gain_ratio"] for s in local_states], dtype=float) if local_states else np.asarray([], dtype=float)
     local_eval["mean_escalation_gain_ratio"] = float(np.mean(escalation_gain_ratio_all)) if len(escalation_gain_ratio_all) else 0.0
@@ -1520,6 +1656,17 @@ def main() -> None:
     local_eval["positive_escalation_rate_train"] = float(np.mean([s["y"] for s in local_states_train])) if local_states_train else 0.0
     local_eval["positive_escalation_rate_val"] = float(np.mean([s["y"] for s in local_states_val])) if local_states_val else 0.0
     local_eval["positive_escalation_rate_test"] = float(np.mean([s["y"] for s in local_states_test])) if local_states_test else 0.0
+    local_eval["pos_weight_used"] = float(pos_weight_used)
+    local_eval["local_band_sample_counts"] = {str(k): int(v) for k, v in local_band_sample_counts.items()}
+    local_eval["local_band_threshold_source"] = {str(k): str(v) for k, v in local_band_threshold_source.items()}
+    state_count_by_band: Dict[str, int] = {label: 0 for _, _, label in PHYSICAL_CENTER_BANDS}
+    for s in local_states:
+        state_count_by_band[str(s["band"])] = state_count_by_band.get(str(s["band"]), 0) + 1
+    local_eval["local_state_count_by_center_band"] = {str(k): int(v) for k, v in state_count_by_band.items()}
+    local_eval["local_state_total_count"] = int(len(local_states))
+    local_eval["local_state_count_train"] = int(len(local_states_train))
+    local_eval["local_state_count_val"] = int(len(local_states_val))
+    local_eval["local_state_count_test"] = int(len(local_states_test))
 
     subsets = _subset_indices(prep)
     assert np.all(np.isin(prep["source_domain"][subsets["true_multipeak_exp_test"]], ["experimental", "exp"])) if len(subsets["true_multipeak_exp_test"]) else True
@@ -1540,6 +1687,27 @@ def main() -> None:
             local_thresholds_by_band=local_thresholds,
         )
         reports[name] = rep
+    dynamic_scenario_rows: Dict[str, List[Dict[str, Any]]] = {}
+    for name in [
+        "uniform_to_shaded_transition",
+        "shaded_to_uniform_transition",
+        "peak_jump_transition",
+        "ambiguous_scan_transition",
+    ]:
+        scenario_rep = evaluate_controller(
+            name,
+            subsets[name],
+            prep["curves_v"],
+            prep["curves_i"],
+            x_std,
+            model,
+            shade_thr,
+            cfg,
+            local_detector=micro,
+            local_thresholds_by_band=local_thresholds,
+        )
+        dynamic_scenario_rows[name] = scenario_rep["rows"]
+        reports[name] = scenario_rep
 
     shade_head_test = model.predict_production(
         torch.from_numpy(x_std[exp_split["test"]]).float().to(cfg.device),
@@ -1551,7 +1719,7 @@ def main() -> None:
     )
     shade_eval = evaluate_coarse_shade_head(shade_head_test["shade_prob"], ys[exp_split["test"]], shade_thr)
 
-    dyn_metrics = evaluate_dynamic_scenarios(reports["dynamic_transition_test"]["rows"])
+    dyn_metrics = evaluate_dynamic_scenarios(dynamic_scenario_rows)
     prof = profile_model_compute(model, input_dim=30, device=cfg.device)
 
     ext_bundle = load_external_validation_bundle(cfg.EXTERNAL_VALIDATION_BUNDLE_PATH)
@@ -1598,6 +1766,7 @@ def main() -> None:
     true_multipeak_sim_benchmark_count = int(len(subsets["true_multipeak_sim_benchmark"]))
     true_multipeak_exp_test_available = true_multipeak_exp_test_count > 0
     true_multipeak_sim_benchmark_available = true_multipeak_sim_benchmark_count > 0
+    multipeak_claim_scope = "simulated_only" if true_multipeak_exp_test_count == 0 else "experimental_and_simulated"
 
     print("\n================ SANITY CHECK ================")
     print(f"pretrain_best_val_loss: {train_info['mlp_pretrain_best_val_loss']}")
@@ -1646,15 +1815,18 @@ def main() -> None:
         + (" (simulated benchmark fallback used)" if bool(subsets["simulated_multipeak_used"][0]) else ""),
         reports["true_multipeak_test"]["metrics"],
     )
-    _print_block("dynamic transition metrics", dyn_metrics)
+    print("\n--- dynamic transition metrics ---")
+    for scenario_name, scenario_metrics in dyn_metrics.items():
+        _print_block(f"dynamic::{scenario_name}", scenario_metrics)
 
     print("\n[True multi-peak subset availability]")
     print(f"true_multipeak_exp_test_available: {true_multipeak_exp_test_available}")
     print(f"true_multipeak_exp_test_count: {true_multipeak_exp_test_count}")
     print(f"true_multipeak_sim_benchmark_available: {true_multipeak_sim_benchmark_available}")
     print(f"true_multipeak_sim_benchmark_count: {true_multipeak_sim_benchmark_count}")
-    if true_multipeak_exp_test_count == 0 and true_multipeak_sim_benchmark_count > 0:
-        print("note: experimental true multi-peak held-out subset is empty; simulated benchmark used for multi-peak stress testing")
+    print(f"multipeak_claim_scope: {multipeak_claim_scope}")
+    if true_multipeak_exp_test_count == 0:
+        print("note: No experimental true-multipeak held-out curves are currently available; multi-peak GMPPT evidence is simulation-backed only.")
 
     print("\n[Local detector production gate]")
     print(f"local_track_detector_gate: {local_eval['local_track_detector_gate']}")
@@ -1664,12 +1836,25 @@ def main() -> None:
     print(f"local_detector_metrics_by_center_band: {local_eval['local_detector_metrics_by_center_band']}")
     print(f"local_track_false_trigger_rate_non_escalation: {local_eval['false_trigger_rate_non_escalation']}")
     print(f"local_track_escalation_recall: {local_eval['escalation_recall']}")
+    print(f"local_band_sample_counts: {local_eval['local_band_sample_counts']}")
+    print(f"local_band_threshold_source: {local_eval['local_band_threshold_source']}")
     print(f"micro_target_definition: {local_eval['micro_target_definition']}")
     print(f"mean_escalation_gain_ratio: {local_eval['mean_escalation_gain_ratio']}")
     print(f"p95_escalation_gain_ratio: {local_eval['p95_escalation_gain_ratio']}")
     print(f"positive_escalation_rate_train: {local_eval['positive_escalation_rate_train']}")
     print(f"positive_escalation_rate_val: {local_eval['positive_escalation_rate_val']}")
     print(f"positive_escalation_rate_test: {local_eval['positive_escalation_rate_test']}")
+    print(f"pos_weight_used: {local_eval['pos_weight_used']}")
+    print(f"local_state_count_by_center_band: {local_eval['local_state_count_by_center_band']}")
+    print(f"local_state_total_count: {local_eval['local_state_total_count']}")
+    print(f"local_state_count_train: {local_eval['local_state_count_train']}")
+    print(f"local_state_count_val: {local_eval['local_state_count_val']}")
+    print(f"local_state_count_test: {local_eval['local_state_count_test']}")
+
+    print("\n[Fallback reason breakdown]")
+    print(f"fallback_reason_counts_nonshaded: {reports['nonshaded_test']['fallback_reason_counts']}")
+    print(f"fallback_reason_counts_shaded: {reports['folder_labeled_shaded_test']['fallback_reason_counts']}")
+    print(f"fallback_reason_counts_true_multipeak: {reports['true_multipeak_test']['fallback_reason_counts']}")
 
     print("\n[Coarse shade head]")
     print(f"shade_threshold: {shade_thr}")
